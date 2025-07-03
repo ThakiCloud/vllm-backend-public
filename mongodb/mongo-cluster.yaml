@@ -1,0 +1,434 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongo-config
+data:
+  mongod.conf: |
+    storage:
+      dbPath: /data/db
+    net:
+      port: 27017
+      bindIp: 0.0.0.0
+    security:
+      authorization: disabled
+  init-replica.js: |
+    // First, restart mongod with replica set configuration
+    db.adminCommand({shutdown: 1});
+    
+    // This script will run after MongoDB restarts
+    
+  config-replica.js: |
+    print("Initializing MongoDB replica set...");
+    
+    try {
+      // Initialize replica set
+      rs.initiate({
+        _id: "rs0",
+        members: [
+          { _id: 0, host: "mongo-0.mongo-service:27017", priority: 5, votes: 1 },
+          { _id: 1, host: "mongo-1.mongo-service:27017", priority: 3, votes: 1 },
+          { _id: 2, host: "mongo-2.mongo-service:27017", priority: 1, votes: 1 }
+        ],
+        settings: {
+          electionTimeoutMillis: 20000  // ⏱️ 20초로 설정
+        }
+      });
+      
+      print("Replica set initiated successfully!");
+      
+      // Wait for replica set to be ready
+      var maxRetries = 30;
+      var retries = 0;
+      var status;
+      do {
+        try {
+          status = rs.status();
+          if (status.ok === 1) {
+            print("Replica set is ready!");
+            break;
+          }
+        } catch (e) {
+          print("Waiting for replica set to be ready... retry " + retries);
+        }
+        sleep(2000);
+        retries++;
+      } while (retries < maxRetries);
+      
+      // Wait for primary to be elected and ready
+      print("Waiting for primary to be ready...");
+      var primaryReady = false;
+      var maxRetries = 30;
+      var retries = 0;
+      
+      while (!primaryReady && retries < maxRetries) {
+        try {
+          var isMasterResult = db.isMaster();
+          if (isMasterResult.ismaster === true) {
+            print("Found primary node, creating database...");
+            primaryReady = true;
+          } else {
+            print("Current node is not primary, waiting... retry " + retries);
+            sleep(2000);
+            retries++;
+          }
+        } catch (e) {
+          print("Error checking primary status: " + e);
+          sleep(2000);
+          retries++;
+        }
+      }
+      
+      if (primaryReady) {
+        print("Creating result_db database...");
+        var resultDb = db.getSiblingDB("result_db");
+        resultDb.createCollection("init");
+        resultDb.init.insertOne({message: "Database initialized automatically", timestamp: new Date()});
+        print("Database result_db created successfully!");
+
+        var collections = resultDb.getCollectionNames();
+        print("Collections in result_db: " + collections);
+
+        print("Creating manage_db database...");
+        var manageDb = db.getSiblingDB("manage_db");
+        manageDb.createCollection("init");
+        manageDb.init.insertOne({message: "Database initialized automatically", timestamp: new Date()});
+        print("Database manage_db created successfully!");
+        
+        // Verify the database was created
+        var collections = manageDb.getCollectionNames();
+        print("Collections in manage_db: " + collections);
+
+        print("Creating deployments database...");
+        var deploymentsDb = db.getSiblingDB("deployments");
+        deploymentsDb.createCollection("init");
+        deploymentsDb.init.insertOne({message: "Database initialized automatically", timestamp: new Date()});
+        print("Database deployments created successfully!");
+        
+        // Verify the database was created
+        var collections = deploymentsDb.getCollectionNames();
+        print("Collections in deployments: " + collections);
+      } else {
+        print("Failed to find primary node after " + maxRetries + " retries");
+      }
+      
+    } catch (e) {
+      print("Error during replica set initialization: " + e);
+    }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-service
+  labels:
+    app: mongo
+spec:
+  ports:
+  - port: 27017
+    targetPort: 27017
+  clusterIP: None
+  selector:
+    app: mongo
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-primary
+  labels:
+    app: mongo
+spec:
+  ports:
+  - port: 27017
+    targetPort: 27017
+  selector:
+    app: mongo
+    statefulset.kubernetes.io/pod-name: mongo-0
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+spec:
+  serviceName: mongo-service
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      initContainers:
+      - name: keyfile-permission-fix
+        image: mongo:7.0
+        command: ['sh', '-c', 'cp /tmp/keyfile-source/mongodb.key /etc/ssl/mongodb.key && chown mongodb:mongodb /etc/ssl/mongodb.key && chmod 400 /etc/ssl/mongodb.key']
+        volumeMounts:
+        - name: mongo-keyfile
+          mountPath: /tmp/keyfile-source
+          readOnly: true
+        - name: keyfile-writable
+          mountPath: /etc/ssl
+        securityContext:
+          runAsUser: 0
+
+      containers:
+      - name: mongo
+        image: mongo:7.0
+        ports:
+        - containerPort: 27017
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - name: mongo-data
+          mountPath: /data/db
+        - name: mongo-config-volume
+          mountPath: /etc/mongod.conf
+          subPath: mongod.conf
+        - name: keyfile-writable
+          mountPath: /etc/ssl
+        args:
+        - --config
+        - /etc/mongod.conf
+        - --replSet
+        - rs0
+
+      volumes:
+      - name: mongo-config-volume
+        configMap:
+          name: mongo-config
+      - name: mongo-keyfile
+        secret:
+          secretName: mongo-keyfile
+          defaultMode: 0400
+      - name: keyfile-writable
+        emptyDir: {}
+
+  volumeClaimTemplates:
+  - metadata:
+      name: mongo-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: csi-rbd-sc
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mongo-init-sa
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: mongo-init-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mongo-init-rolebinding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: mongo-init-sa
+  namespace: default
+roleRef:
+  kind: Role
+  name: mongo-init-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongo-replica-init
+spec:
+  # 완료 후 정리 (2분)
+  ttlSecondsAfterFinished: 120
+
+  template:
+    spec:
+      serviceAccountName: mongo-init-sa
+      restartPolicy: OnFailure
+      containers:
+      - name: mongo-init
+        image: mongo:7.0
+        env:
+        - name: MONGO_USERNAME
+          value: "admin"
+        - name: MONGO_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongo-secret
+              key: mongodb-root-password
+        volumeMounts:
+        - name: init-script
+          mountPath: /scripts
+        - name: mongo-keyfile
+          mountPath: /etc/ssl/mongodb.key
+          subPath: mongodb.key
+          readOnly: true
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Update package list and install curl
+          apt-get update && apt-get install -y curl
+
+          # Install kubectl and mongosh
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          
+          echo "Waiting for all MongoDB pods to be ready..."
+          
+          # Wait for mongo-0 (without authentication initially)
+          until mongosh --host mongo-0.mongo-service:27017 --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+            echo "Waiting for mongo-0 to be ready..."
+            sleep 5
+          done
+          echo "mongo-0 is ready!"
+          
+          # Wait for mongo-1
+          until mongosh --host mongo-1.mongo-service:27017 --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+            echo "Waiting for mongo-1 to be ready..."
+            sleep 5
+          done
+          echo "mongo-1 is ready!"
+          
+          # Wait for mongo-2
+          until mongosh --host mongo-2.mongo-service:27017 --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+            echo "Waiting for mongo-2 to be ready..."
+            sleep 5
+          done
+          echo "mongo-2 is ready!"
+          
+          echo "All MongoDB pods are ready! Configuring replica set..."
+          sleep 10
+          
+          # Configure replica set first (without authentication)
+          mongosh --host mongo-0.mongo-service:27017 /scripts/config-replica.js
+          
+          echo "Replica set configured! Creating admin user with Secret password..."
+          sleep 10
+          
+          # Create admin user on primary node using environment variable from Secret
+          mongosh --host mongo-0.mongo-service:27017 --eval "
+            try {
+              db.getSiblingDB('admin').createUser({
+                user: '$MONGO_USERNAME',
+                pwd: '$MONGO_PASSWORD',
+                roles: [
+                  { role: 'root', db: 'admin' },
+                  { role: 'clusterAdmin', db: 'admin' },
+                  { role: 'userAdminAnyDatabase', db: 'admin' },
+                  { role: 'dbAdminAnyDatabase', db: 'admin' },
+                  { role: 'readWriteAnyDatabase', db: 'admin' }
+                ]
+              });
+              print('Admin user created successfully with Secret password!');
+            } catch (e) {
+              print('Error creating admin user: ' + e);
+            }
+          "
+          
+          echo "Admin user created! Now enabling authentication..."
+          sleep 5
+          
+          # Update ConfigMap to enable authentication
+          kubectl patch configmap mongo-config --patch '{
+            "data": {
+              "mongod.conf": "storage:\n  dbPath: /data/db\nnet:\n  port: 27017\n  bindIp: 0.0.0.0\nsecurity:\n  authorization: enabled\n  keyFile: /etc/ssl/mongodb.key"
+            }
+          }'
+          
+          echo "ConfigMap updated! Restarting MongoDB pods to enable authentication..."
+          
+          # Restart all MongoDB pods to apply new configuration
+          kubectl delete pod mongo-0 mongo-1 mongo-2
+          
+          echo "MongoDB pods restarted! Waiting for them to come back up with authentication..."
+          sleep 60
+          
+          # Wait for pods to restart with authentication
+          until mongosh --host mongo-0.mongo-service:27017 -u $MONGO_USERNAME -p $MONGO_PASSWORD --authenticationDatabase admin --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+            echo "Waiting for mongo-0 to restart with authentication..."
+            sleep 10
+          done
+          
+          echo "MongoDB cluster initialization completed with authentication enabled!"
+          echo "You can now connect using: mongosh --host mongo-primary:27017 -u $MONGO_USERNAME -p $MONGO_PASSWORD --authenticationDatabase admin"
+      volumes:
+      - name: init-script
+        configMap:
+          name: mongo-config
+      - name: mongo-keyfile
+        secret:
+          secretName: mongo-keyfile
+          defaultMode: 0400
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mongo-pv-0
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: csi-rbd-sc
+  hostPath:
+    path: /tmp/mongo-data-0
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mongo-pv-1
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: csi-rbd-sc
+  hostPath:
+    path: /tmp/mongo-data-1
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mongo-pv-2
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: csi-rbd-sc
+  hostPath:
+    path: /tmp/mongo-data-2

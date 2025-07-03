@@ -1,0 +1,158 @@
+name: 🚀 Deploy All Services
+
+on:
+  push:
+    tags:
+      - 'release-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      deployer_tag:
+        description: 'benchmark-deployer tag (e.g., benchmark-deployer-v1.0.0) - leave empty to skip'
+        required: false
+        type: string
+      manager_tag:
+        description: 'benchmark-manager tag (e.g., benchmark-manager-v1.1.0) - leave empty to skip'
+        required: false
+        type: string
+      results_tag:
+        description: 'benchmark-results tag (e.g., benchmark-results-v0.9.0) - leave empty to skip'
+        required: false
+        type: string
+      target_version:
+        description: 'Target deployment version (e.g., v1.0.0)'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy-all-services:
+    name: 🚀 Deploy Services to Production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: ⚙️ Set deployment parameters
+        id: set_params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "target_version=${{ github.event.inputs.target_version }}" >> $GITHUB_OUTPUT
+            echo "deployer_tag=${{ github.event.inputs.deployer_tag }}" >> $GITHUB_OUTPUT
+            echo "manager_tag=${{ github.event.inputs.manager_tag }}" >> $GITHUB_OUTPUT
+            echo "results_tag=${{ github.event.inputs.results_tag }}" >> $GITHUB_OUTPUT
+          else
+            VERSION_TAG=$(echo "${{ github.ref_name }}" | sed -E 's/^release-(v.*)$/\1/')
+            echo "target_version=${VERSION_TAG}" >> $GITHUB_OUTPUT
+            echo "deployer_tag=benchmark-deployer-${VERSION_TAG}" >> $GITHUB_OUTPUT
+            echo "manager_tag=benchmark-manager-${VERSION_TAG}" >> $GITHUB_OUTPUT
+            echo "results_tag=benchmark-results-${VERSION_TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔑 Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐦 Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: 🚀 Deploy benchmark-deployer
+        if: steps.set_params.outputs.services == 'all' || steps.set_params.outputs.services == 'benchmark-deployer'
+        id: deploy_deployer
+        run: |
+          SERVICE_NAME="benchmark-deployer"
+          IMAGE_NAME_LOWERCASE=$(echo '${{ env.IMAGE_NAME }}-${SERVICE_NAME}' | tr '[:upper:]' '[:lower:]')
+          
+          # Find latest release image
+          LATEST_RELEASE_TAG=$(crane ls ${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE} | grep "release-" | sort -r | head -n 1)
+          if [ -z "$LATEST_RELEASE_TAG" ]; then
+            echo "Error: No release-* image found for ${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE}."
+            exit 1
+          fi
+          
+          echo "Found latest release tag for ${SERVICE_NAME}: $LATEST_RELEASE_TAG"
+          
+          # Tag with version
+          SRC_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE}:${LATEST_RELEASE_TAG}"
+          echo "Tagging ${SRC_IMAGE} with ${{ steps.set_params.outputs.version }}"
+          crane tag "${SRC_IMAGE}" "${{ steps.set_params.outputs.version }}"
+          
+          echo "deployed_image=${IMAGE_NAME_LOWERCASE}:${{ steps.set_params.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: 📊 Deploy benchmark-manager
+        if: steps.set_params.outputs.services == 'all' || steps.set_params.outputs.services == 'benchmark-manager'
+        id: deploy_manager
+        run: |
+          SERVICE_NAME="benchmark-manager"
+          IMAGE_NAME_LOWERCASE=$(echo '${{ env.IMAGE_NAME }}-${SERVICE_NAME}' | tr '[:upper:]' '[:lower:]')
+          
+          # Find latest release image
+          LATEST_RELEASE_TAG=$(crane ls ${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE} | grep "release-" | sort -r | head -n 1)
+          if [ -z "$LATEST_RELEASE_TAG" ]; then
+            echo "Error: No release-* image found for ${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE}."
+            exit 1
+          fi
+          
+          echo "Found latest release tag for ${SERVICE_NAME}: $LATEST_RELEASE_TAG"
+          
+          # Tag with version
+          SRC_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE}:${LATEST_RELEASE_TAG}"
+          echo "Tagging ${SRC_IMAGE} with ${{ steps.set_params.outputs.version }}"
+          crane tag "${SRC_IMAGE}" "${{ steps.set_params.outputs.version }}"
+          
+          echo "deployed_image=${IMAGE_NAME_LOWERCASE}:${{ steps.set_params.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: 📈 Deploy benchmark-results
+        if: steps.set_params.outputs.services == 'all' || steps.set_params.outputs.services == 'benchmark-results'
+        id: deploy_results
+        run: |
+          SERVICE_NAME="benchmark-results"
+          IMAGE_NAME_LOWERCASE=$(echo '${{ env.IMAGE_NAME }}-${SERVICE_NAME}' | tr '[:upper:]' '[:lower:]')
+          
+          # Find latest release image
+          LATEST_RELEASE_TAG=$(crane ls ${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE} | grep "release-" | sort -r | head -n 1)
+          if [ -z "$LATEST_RELEASE_TAG" ]; then
+            echo "Error: No release-* image found for ${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE}."
+            exit 1
+          fi
+          
+          echo "Found latest release tag for ${SERVICE_NAME}: $LATEST_RELEASE_TAG"
+          
+          # Tag with version
+          SRC_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME_LOWERCASE}:${LATEST_RELEASE_TAG}"
+          echo "Tagging ${SRC_IMAGE} with ${{ steps.set_params.outputs.version }}"
+          crane tag "${SRC_IMAGE}" "${{ steps.set_params.outputs.version }}"
+          
+          echo "deployed_image=${IMAGE_NAME_LOWERCASE}:${{ steps.set_params.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: ✅ Deployment Summary
+        run: |
+          echo "### 🚀 Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ steps.set_params.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed Services:**" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.set_params.outputs.services }}" = "all" ] || [ "${{ steps.set_params.outputs.services }}" = "benchmark-deployer" ]; then
+            if [ ! -z "${{ steps.deploy_deployer.outputs.deployed_image }}" ]; then
+              echo "- 🚀 benchmark-deployer: \`${{ env.REGISTRY }}/${{ steps.deploy_deployer.outputs.deployed_image }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          if [ "${{ steps.set_params.outputs.services }}" = "all" ] || [ "${{ steps.set_params.outputs.services }}" = "benchmark-manager" ]; then
+            if [ ! -z "${{ steps.deploy_manager.outputs.deployed_image }}" ]; then
+              echo "- 📊 benchmark-manager: \`${{ env.REGISTRY }}/${{ steps.deploy_manager.outputs.deployed_image }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          if [ "${{ steps.set_params.outputs.services }}" = "all" ] || [ "${{ steps.set_params.outputs.services }}" = "benchmark-results" ]; then
+            if [ ! -z "${{ steps.deploy_results.outputs.deployed_image }}" ]; then
+              echo "- 📈 benchmark-results: \`${{ env.REGISTRY }}/${{ steps.deploy_results.outputs.deployed_image }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi 

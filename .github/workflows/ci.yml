@@ -1,0 +1,170 @@
+name: CI - Lint & Test
+
+on:
+  push:
+    branches-ignore:
+      - 'main'
+      - 'hotfix/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-lint:
+    name: 🐍 Python Lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [benchmark-deployer, benchmark-manager, benchmark-results]
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 📦 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 📦 Install dependencies
+        run: |
+          cd ${{ matrix.service }}
+          pip install -r requirements.txt
+          pip install flake8 black isort
+      - name: 🔍 Run Black (format check)
+        run: |
+          cd ${{ matrix.service }}
+          black --check .
+        continue-on-error: true
+      - name: 🔍 Run isort (import sort check)
+        run: |
+          cd ${{ matrix.service }}
+          isort --check-only .
+        continue-on-error: true
+      - name: 🔍 Run flake8
+        run: |
+          cd ${{ matrix.service }}
+          flake8 .
+        continue-on-error: true
+
+  python-test:
+    name: 🧪 Python Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [benchmark-deployer, benchmark-manager, benchmark-results]
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 📦 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 📦 Install dependencies
+        run: |
+          cd ${{ matrix.service }}
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+      - name: 🧪 Run tests
+        run: |
+          cd ${{ matrix.service }}
+          if [ -d "tests" ]; then
+            pytest tests/ --cov=. --cov-report=xml
+          else
+            echo "No tests directory found for ${{ matrix.service }}"
+          fi
+        continue-on-error: true
+
+  shell-lint:
+    name: 📜 Shell Script Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 🔍 Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './mongodb'
+        continue-on-error: true
+
+  dockerfile-lint:
+    name: 🐳 Dockerfile Lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [benchmark-deployer, benchmark-manager, benchmark-results]
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 🔍 Run hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: '${{ matrix.service }}/Dockerfile'
+        continue-on-error: true
+
+  markdown-lint:
+    name: 📝 Markdown Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 📦 Install markdownlint
+        run: npm install -g markdownlint-cli
+      - name: 📝 Create markdownlint config
+        run: |
+          cat > .markdownlint.json << 'EOF'
+          {
+            "MD013": false,
+            "MD033": false,
+            "MD034": false,
+            "MD036": false,
+            "MD041": false
+          }
+          EOF
+      - name: 🔍 Run Markdown lint
+        run: |
+          markdownlint '**/*.md' --config .markdownlint.json || echo "⚠️ Markdown lint issues found, but continuing..."
+        continue-on-error: true
+
+  yaml-lint:
+    name: 📄 YAML Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 📦 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 📦 Install yamllint
+        run: pip install yamllint
+      - name: 🔍 Run YAML lint
+        run: |
+          yamllint -d relaxed . || echo "⚠️ YAML lint issues found, but continuing..."
+        continue-on-error: true
+
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [benchmark-deployer, benchmark-manager, benchmark-results]
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      - name: 📦 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 📦 Install safety
+        run: pip install safety
+      - name: 🔒 Run safety check
+        run: |
+          cd ${{ matrix.service }}
+          safety check -r requirements.txt
+        continue-on-error: true
