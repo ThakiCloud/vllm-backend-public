@@ -18,7 +18,7 @@ except ImportError:
 
 from models import ModelEvent, PollingResult, GitHubConfig
 from github_client import GitHubClient
-from config import DEFAULT_POLL_HOURS
+from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,28 @@ class MLflowManager:
                         )
                         if success:
                             logger.info(f"GitHub 업데이트 성공: {version.name}:{version.version} (run_id: {version.run_id})")
+                            
+                            # benchmark-eval 서비스에 평가 요청 보내기
+                            try:
+                                eval_payload = {
+                                    "model_name": version.name,
+                                    "vllm_url": f"http://vllm-{version.name}.vllm:8000"
+                                }
+                                
+                                response = requests.post(
+                                    BENCHMARK_EVAL_URL,
+                                    json=eval_payload,
+                                    headers={"Content-Type": "application/json"},
+                                    timeout=10
+                                )
+                                
+                                if response.status_code == 200:
+                                    logger.info(f"평가 요청 성공: {version.name} -> {BENCHMARK_EVAL_URL}")
+                                else:
+                                    logger.warning(f"평가 요청 실패: {version.name} (status: {response.status_code})")
+                                    
+                            except Exception as e:
+                                logger.error(f"평가 요청 중 오류: {version.name} - {e}")
                         else:
                             logger.error(f"GitHub 업데이트 실패: {version.name}:{version.version} (run_id: {version.run_id})")
                     except Exception as e:

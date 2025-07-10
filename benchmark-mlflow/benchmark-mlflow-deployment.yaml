@@ -40,6 +40,8 @@ spec:
           value: "0.0.0.0"
         - name: SERVER_PORT
           value: "8003"
+        - name: BENCHMARK_EVAL_URL
+          value: "http://benchmark-eval:8004/evaluate"
         resources:
           requests:
             memory: "128Mi"

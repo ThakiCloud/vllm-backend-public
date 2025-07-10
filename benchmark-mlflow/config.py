@@ -24,7 +24,8 @@ GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPO_OWNER = os.getenv('GITHUB_REPO_OWNER')
 GITHUB_REPO_NAME = os.getenv('GITHUB_REPO_NAME')
 
-
+# Benchmark Eval Configuration
+BENCHMARK_EVAL_URL = os.getenv('BENCHMARK_EVAL_URL', 'http://benchmark-eval:8004/evaluate')
 
 # State Management (GitHub 기반으로 전환)
 

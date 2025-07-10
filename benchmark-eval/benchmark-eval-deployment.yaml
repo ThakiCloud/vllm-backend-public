@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-eval
+  namespace: default
+  labels:
+    app: benchmark-eval
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: benchmark-eval
+  template:
+    metadata:
+      labels:
+        app: benchmark-eval
+    spec:
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: eval
+        image: ghcr.io/yunjae-park1111/eval:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8004
+        env:
+        - name: BENCHMARK_DEPLOY_URL
+          value: "http://benchmark-deploy:8002"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "8004"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: GITHUB_OWNER
+          value: "thakicloud"
+        - name: GITHUB_REPO
+          value: "mlflow-vllm"
+        - name: GITHUB_CONFIG_PATH
+          value: "evaluate/evaluate.config"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: benchmark-shared-secrets
+              key: GITHUB_TOKEN
+        - name: EVALUATION_DELAY_MINUTES
+          value: "30"
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: benchmark-eval
+  namespace: default
+  labels:
+    app: benchmark-eval
+spec:
+  selector:
+    app: benchmark-eval
+  ports:
+  - port: 8004
+    targetPort: 8004
+    protocol: TCP
+  type: ClusterIP 
