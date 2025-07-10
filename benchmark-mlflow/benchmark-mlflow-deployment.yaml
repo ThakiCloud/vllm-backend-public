@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-mlflow
+  labels:
+    app: benchmark-mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: benchmark-mlflow
+  template:
+    metadata:
+      labels:
+        app: benchmark-mlflow
+    spec:
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: benchmark-mlflow
+        image: ghcr.io/yunjae-park1111/benchmark-mlflow:v1.0.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8003
+        env:
+        - name: MLFLOW_TRACKING_URI
+          value: "http://mlflow-tracking.mlflow:8080"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: benchmark-shared-secrets
+              key: GITHUB_TOKEN
+        - name: GITHUB_REPO_OWNER
+          value: "ThakiCloud"
+        - name: GITHUB_REPO_NAME
+          value: "mlflow-vllm"
+        - name: POLLING_INTERVAL
+          value: "60"
+        - name: SERVER_HOST
+          value: "0.0.0.0"
+        - name: SERVER_PORT
+          value: "8003"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: benchmark-mlflow
+  labels:
+    app: benchmark-mlflow
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8003
+    targetPort: 8003
+    protocol: TCP
+    name: http
+  selector:
+    app: benchmark-mlflow
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benchmark-mlflow-config
+data:
+  DEFAULT_POLLING_INTERVAL: "60"
+  DEFAULT_POLL_HOURS: "24" 
