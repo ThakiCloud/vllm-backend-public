@@ -106,7 +106,7 @@ async def execute_evaluation_after_delay(model_name: str, vllm_url: str, delay_m
         
         # Load and process the template
         template = await load_evaluate_config_template()
-        processed_yaml = process_template(template, model_name, vllm_url)
+        processed_yaml = process_template(template, model_name.replace('_', '-').replace('.', '-'), vllm_url)
         
         # Validate YAML
         try:
