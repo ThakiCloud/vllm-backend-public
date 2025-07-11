@@ -205,7 +205,7 @@ class MLflowManager:
                             try:
                                 eval_payload = {
                                     "model_name": version.name,
-                                    "vllm_url": f"http://vllm-{version.name}.vllm:8000"
+                                    "vllm_url": f"http://vllm-{version.name.replace('_', '-').replace('.', '-').lower()}.vllm:8000"
                                 }
                                 
                                 response = requests.post(
