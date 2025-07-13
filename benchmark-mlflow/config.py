@@ -11,13 +11,16 @@ except ImportError:
 # Application Configuration
 # -----------------------------------------------------------------------------
 
+NEW_MODEL_EVALUATION = os.getenv('NEW_MODEL_EVALUATION', 'true')
+ARGO_FILE_PATH = os.getenv('ARGO_FILE_PATH', 'argo-application.yaml')
+
 # MLflow Configuration
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
-POLLING_INTERVAL = int(os.getenv('POLLING_INTERVAL'))
+POLLING_INTERVAL = int(os.getenv('POLLING_INTERVAL', '60'))
 
 # Server Configuration
-SERVER_HOST = os.getenv('SERVER_HOST')
-SERVER_PORT = int(os.getenv('SERVER_PORT'))
+SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.getenv('SERVER_PORT', '8003'))
 
 # GitHub Configuration
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')

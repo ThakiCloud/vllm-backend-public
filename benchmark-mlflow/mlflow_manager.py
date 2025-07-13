@@ -18,7 +18,7 @@ except ImportError:
 
 from models import ModelEvent, PollingResult, GitHubConfig
 from github_client import GitHubClient
-from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL
+from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL, NEW_MODEL_EVALUATION
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,10 @@ class MLflowManager:
                     is_new = existing_file is None
                     event_type = "model_version_created" if is_new else "model_version_updated"
                     
+                    if not NEW_MODEL_EVALUATION:
+                        logger.info(f"NEW_MODEL_EVALUATION is false, skipping evaluation for {version.name}:{version.version}")
+                        continue
+                    
                     event = ModelEvent(
                         event_type=event_type,
                         model_name=version.name,
@@ -200,6 +204,17 @@ class MLflowManager:
                         )
                         if success:
                             logger.info(f"GitHub 업데이트 성공: {version.name}:{version.version} (run_id: {version.run_id})")
+                            
+                            # NEW_MODEL_EVALUATION이 true이고 새로운 모델인 경우 argo-application.yaml에 추가
+                            if NEW_MODEL_EVALUATION and is_new:
+                                try:
+                                    argo_success = self.github_client.add_model_to_argo_application(version.name)
+                                    if argo_success:
+                                        logger.info(f"argo-application.yaml에 {version.name}.yaml 추가 성공")
+                                    else:
+                                        logger.error(f"argo-application.yaml에 {version.name}.yaml 추가 실패")
+                                except Exception as e:
+                                    logger.error(f"argo-application.yaml 업데이트 중 오류: {version.name} - {e}")
                             
                             # benchmark-eval 서비스에 평가 요청 보내기
                             try:

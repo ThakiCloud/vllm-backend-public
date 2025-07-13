@@ -5,6 +5,7 @@ import logging
 from typing import Dict, Optional
 
 from models import GitHubConfig, GitHubFileUpdate
+from config import ARGO_FILE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,75 @@ class GitHubClient:
                 
         except Exception as e:
             logger.error(f"YAML 파일 업데이트 중 오류 발생: {e}")
+            return False
+
+    def add_model_to_argo_application(self, model_name: str) -> bool:
+        """
+        argo-application.yaml 파일의 valueFiles 섹션에 새로운 모델 파일 추가
+        
+        Args:
+            model_name: 모델 이름
+            
+        Returns:
+            업데이트 성공 여부
+        """
+        try:
+            argo_file_path = ARGO_FILE_PATH
+            yaml_file_name = f"{model_name}.yaml"
+            
+            # 기존 파일 내용 가져오기
+            file_info = self.get_file_content(argo_file_path)
+            
+            if not file_info:
+                logger.error(f"argo-application.yaml 파일을 찾을 수 없습니다.")
+                return False
+            
+            # 파일 내용 디코딩
+            content = base64.b64decode(file_info['content']).decode('utf-8')
+            yaml_data = yaml.safe_load(content)
+            
+            # valueFiles 섹션 확인 및 업데이트
+            if 'spec' not in yaml_data:
+                yaml_data['spec'] = {}
+            if 'source' not in yaml_data['spec']:
+                yaml_data['spec']['source'] = {}
+            if 'helm' not in yaml_data['spec']['source']:
+                yaml_data['spec']['source']['helm'] = {}
+            if 'valueFiles' not in yaml_data['spec']['source']['helm']:
+                yaml_data['spec']['source']['helm']['valueFiles'] = []
+            
+            # 이미 존재하는지 확인
+            if yaml_file_name not in yaml_data['spec']['source']['helm']['valueFiles']:
+                yaml_data['spec']['source']['helm']['valueFiles'].append(yaml_file_name)
+                logger.info(f"argo-application.yaml에 {yaml_file_name} 추가")
+                
+                # YAML 다시 직렬화
+                updated_content = yaml.dump(yaml_data, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                
+                # 커밋 메시지 생성
+                commit_message = f"Add {yaml_file_name} to argo-application valueFiles"
+                
+                # 파일 업데이트
+                file_update = GitHubFileUpdate(
+                    file_path=argo_file_path,
+                    content=updated_content,
+                    commit_message=commit_message,
+                    sha=file_info['sha']
+                )
+                
+                result = self.update_file(file_update)
+                
+                if result:
+                    logger.info(f"argo-application.yaml 업데이트 완료: {yaml_file_name} 추가")
+                    return True
+                else:
+                    return False
+            else:
+                logger.info(f"{yaml_file_name}이 이미 argo-application.yaml에 존재합니다.")
+                return True
+                
+        except Exception as e:
+            logger.error(f"argo-application.yaml 업데이트 중 오류 발생: {e}")
             return False
     
     def _get_yaml_template(self, run_id: str, experiment_id: str = "1", model_name: str = "Qwen/Qwen3-0.6B", version: str = "1", model_id: str = None) -> Dict:
