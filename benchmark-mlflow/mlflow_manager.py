@@ -18,7 +18,7 @@ except ImportError:
 
 from models import ModelEvent, PollingResult, GitHubConfig
 from github_client import GitHubClient
-from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL, NEW_MODEL_EVALUATION
+from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL, NEW_MODEL_EVALUATION, ARGO_AUTO_DEPLOY, ARGOCD_PROJECT_NAME, YAML_MODEL_FILE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class MLflowManager:
     def _get_latest_model_versions(self) -> List[ModelVersion]:
         """각 모델의 가장 최신 버전만 조회 (GitHub과 비교하여 새로운 것만)"""
         new_versions = []
-        
+        existing_files = []
         try:
             registered_models = self.mlflow_client.search_registered_models()
             
@@ -72,9 +72,12 @@ class MLflowManager:
                         
                         # GitHub의 기존 run_id와 비교
                         if self.github_client:
-                            yaml_file_path = f"{model.name}.yaml"
+                            if YAML_MODEL_FILE_PATH:
+                                yaml_file_path = f"{YAML_MODEL_FILE_PATH}/{model.name}.yaml"
+                            else:
+                                yaml_file_path = f"{model.name}.yaml"
                             existing_file = self.github_client.get_file_content(yaml_file_path)
-                            
+                            existing_files.append(existing_file)                                
                             if existing_file:
                                 try:
                                     import base64
@@ -94,7 +97,8 @@ class MLflowManager:
                                 except Exception as e:
                                     logger.warning(f"GitHub 파일 파싱 실패 ({model.name}): {e}")
                                     # 파싱 실패시 새로운 것으로 간주
-                        
+                        else:
+                            existing_files.append(None)
                         # 새로운 버전만 추가
                         new_versions.append(latest_version)
                         logger.debug(f"새로운 모델 버전 발견: {model.name}:{latest_version.version} (run_id: {latest_version.run_id})")
@@ -106,7 +110,7 @@ class MLflowManager:
         except Exception as e:
             logger.error(f"모델 버전 조회 실패: {e}")
         
-        return new_versions
+        return new_versions, existing_files
     
     def _get_experiment_id_from_run(self, run_id: str) -> str:
         """run_id에서 experiment_id 조회"""
@@ -150,73 +154,79 @@ class MLflowManager:
         
         try:
             # 각 모델의 최신 버전들 확인
-            latest_versions = self._get_latest_model_versions()
+            latest_versions, existing_files = self._get_latest_model_versions()
             
-            for version in latest_versions:
+            for version, existing_file in zip(latest_versions, existing_files):
                 if not version.run_id:
                     continue
                 
-                # _get_latest_model_versions()에서 이미 새로운 것만 반환하므로 바로 처리
-                if self.github_client:
-                    yaml_file_path = f"{version.name}.yaml"
-                    existing_file = self.github_client.get_file_content(yaml_file_path)
+                is_new = existing_file is None
+                event_type = "model_version_created" if is_new else "model_version_updated"
+                
+                event = ModelEvent(
+                    event_type=event_type,
+                    model_name=version.name,
+                    version=version.version,
+                    run_id=version.run_id,
+                    status=version.current_stage,
+                    user_id=version.user_id,
+                    creation_time=version.creation_timestamp,
+                    source=version.source,
+                    description=version.description,
+                    timestamp=time.time()
+                )
+                events.append(event)
+                
+                if is_new:
+                    logger.info(f"새로운 모델 감지: {version.name}:{version.version} (run_id: {version.run_id})")
+                else:
+                    logger.info(f"모델 업데이트 감지: {version.name}:{version.version} (run_id: {version.run_id})")
+                
+                # GitHub 레포 업데이트 (existing_file 정보 재사용)
+                try:
+                    # run_id에서 experiment_id 조회
+                    experiment_id = self._get_experiment_id_from_run(version.run_id)
                     
-                    is_new = existing_file is None
-                    event_type = "model_version_created" if is_new else "model_version_updated"
+                    # source에서 model_id 추출
+                    model_id = self._extract_model_id_from_source(version.source)
                     
-                    if not NEW_MODEL_EVALUATION:
-                        logger.info(f"NEW_MODEL_EVALUATION is false, skipping evaluation for {version.name}:{version.version}")
-                        continue
-                    
-                    event = ModelEvent(
-                        event_type=event_type,
-                        model_name=version.name,
-                        version=version.version,
-                        run_id=version.run_id,
-                        status=version.current_stage,
-                        user_id=version.user_id,
-                        creation_time=version.creation_timestamp,
-                        source=version.source,
-                        description=version.description,
-                        timestamp=time.time()
+                    # update_yaml_models에 기존 파일 정보 전달하여 중복 호출 방지
+                    success = self.github_client.update_yaml_models(
+                        version.run_id, 
+                        version.name, 
+                        version.version,
+                        experiment_id,
+                        model_id,
+                        existing_file  # 기존 파일 정보 전달
                     )
-                    events.append(event)
-                    
-                    if is_new:
-                        logger.info(f"새로운 모델 감지: {version.name}:{version.version} (run_id: {version.run_id})")
-                    else:
-                        logger.info(f"모델 업데이트 감지: {version.name}:{version.version} (run_id: {version.run_id})")
-                    
-                    # GitHub 레포 업데이트
-                    try:
-                        # run_id에서 experiment_id 조회
-                        experiment_id = self._get_experiment_id_from_run(version.run_id)
+                    if success:
+                        logger.info(f"GitHub 업데이트 성공: {version.name}:{version.version} (run_id: {version.run_id})")
                         
-                        # source에서 model_id 추출
-                        model_id = self._extract_model_id_from_source(version.source)
+                        # 새로운 모델인 경우 ArgoCD 프로젝트 생성
+                        if ARGO_AUTO_DEPLOY and is_new:
+                            try:
+                                project_success = self.github_client.create_argo_project()
+                                if project_success:
+                                    logger.info(f"ArgoCD 프로젝트 생성 성공: {ARGOCD_PROJECT_NAME}")
+                                else:
+                                    logger.warning(f"ArgoCD 프로젝트 생성 실패: {ARGOCD_PROJECT_NAME}")
+                            except Exception as e:
+                                logger.error(f"ArgoCD 프로젝트 생성 중 오류: {ARGOCD_PROJECT_NAME} - {e}")
+                            
+                            try:
+                                argo_success = self.github_client.add_model_to_argo_application(version.name)
+                                if argo_success:
+                                    logger.info(f"ArgoCD Application 생성 성공: {ARGOCD_PROJECT_NAME} - {version.name}")
+                                else:
+                                    logger.error(f"ArgoCD Application 생성 실패: {ARGOCD_PROJECT_NAME} - {version.name}")
+                            except Exception as e:
+                                logger.error(f"ArgoCD Application 생성 중 오류: {ARGOCD_PROJECT_NAME} - {version.name} - {e}")
+                        elif not ARGO_AUTO_DEPLOY:
+                            logger.info(f"ARGO_AUTO_DEPLOY가 비활성화되어 {ARGOCD_PROJECT_NAME}의 {version.name}의 ArgoCD 프로젝트 생성을 건너뜁니다.")
                         
-                        success = self.github_client.update_yaml_models(
-                            version.run_id, 
-                            version.name, 
-                            version.version,
-                            experiment_id,
-                            model_id
-                        )
-                        if success:
-                            logger.info(f"GitHub 업데이트 성공: {version.name}:{version.version} (run_id: {version.run_id})")
-                            
-                            # NEW_MODEL_EVALUATION이 true이고 새로운 모델인 경우 argo-application.yaml에 추가
-                            if NEW_MODEL_EVALUATION and is_new:
-                                try:
-                                    argo_success = self.github_client.add_model_to_argo_application(version.name)
-                                    if argo_success:
-                                        logger.info(f"argo-application.yaml에 {version.name}.yaml 추가 성공")
-                                    else:
-                                        logger.error(f"argo-application.yaml에 {version.name}.yaml 추가 실패")
-                                except Exception as e:
-                                    logger.error(f"argo-application.yaml 업데이트 중 오류: {version.name} - {e}")
-                            
-                            # benchmark-eval 서비스에 평가 요청 보내기
+                        # benchmark-eval 서비스에 평가 요청 보내기
+                        if NEW_MODEL_EVALUATION:
+                            logger.info(f"NEW_MODEL_EVALUATION: {NEW_MODEL_EVALUATION}")
                             try:
                                 eval_payload = {
                                     "model_name": version.name,
@@ -236,12 +246,14 @@ class MLflowManager:
                                     logger.warning(f"평가 요청 실패: {version.name} (status: {response.status_code})")
                                     
                             except Exception as e:
-                                logger.error(f"평가 요청 중 오류: {version.name} - {e}")
+                                    logger.error(f"평가 요청 중 오류: {version.name} - {e}")
                         else:
-                            logger.error(f"GitHub 업데이트 실패: {version.name}:{version.version} (run_id: {version.run_id})")
-                    except Exception as e:
-                        logger.error(f"GitHub 업데이트 중 오류: {e}")
-            
+                            logger.info(f"NEW_MODEL_EVALUATION가 비활성화되어 {version.name}의 평가를 건너뜁니다.")
+                    else:
+                        logger.error(f"GitHub 업데이트 실패: {version.name}:{version.version} (run_id: {version.run_id})")
+                except Exception as e:
+                    logger.error(f"GitHub 업데이트 중 오류: {e}")
+        
         except Exception as e:
             logger.error(f"새로운 모델 버전 확인 실패: {e}")
         

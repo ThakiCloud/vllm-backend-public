@@ -35,7 +35,7 @@ class GitHubFileUpdate(BaseModel):
     content: str = Field(..., description="파일 내용")
     commit_message: str = Field(..., description="커밋 메시지")
     branch: str = Field("main", description="브랜치명")
-    sha: Optional[str] = Field(None, description="파일 SHA")
+
 
 class GitHubConfig(BaseModel):
     """GitHub 설정 정보"""

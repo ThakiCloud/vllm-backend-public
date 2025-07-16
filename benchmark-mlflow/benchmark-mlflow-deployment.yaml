@@ -43,9 +43,35 @@ spec:
         - name: BENCHMARK_EVAL_URL
           value: "http://benchmark-eval:8004/evaluate"
         - name: NEW_MODEL_EVALUATION
-          value: "true"
+          value: "0"
         - name: ARGO_FILE_PATH
-          value: "argo-application.yaml"
+          value: "template/applications.yaml"
+        - name: ARGO_AUTO_DEPLOY
+          value: "0"
+        - name: YAML_TEMPLATE_PATH
+          value: "template/vllm.yaml"
+        - name: YAML_MODEL_FILE_PATH
+          value: ""
+        - name: ARGO_APPLICATION_PATH
+          value: "applications"
+        - name: ARGO_PROJECT_PATH
+          value: "projects"
+        - name: ARGO_PROJECT_TEMPLATE_PATH
+          value: "template/projects.yaml"
+        - name: TEMPLATE_REPO_OWNER
+          value: "ThakiCloud"
+        - name: TEMPLATE_REPO_NAME
+          value: "mlflow-vllm"
+        - name: ARGO_REPO_OWNER
+          value: "ThakiCloud"
+        - name: ARGO_REPO_NAME
+          value: "argo-applications"
+        - name: ARGOCD_PROJECT_NAME
+          value: "mlflow-vllm"
+        - name: ARGOCD_REPO_URL
+          value: "git@github.com:ThakiCloud/mlflow-vllm.git"
+        - name: ARGOCD_NAMESPACE
+          value: "vllm"
         resources:
           requests:
             memory: "128Mi"
