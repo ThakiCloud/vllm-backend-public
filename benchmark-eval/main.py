@@ -52,7 +52,7 @@ async def load_evaluate_config_template() -> str:
 
 def process_template(template: str, model_name: str, vllm_url: str) -> str:
     """Replace placeholders in template with actual values"""
-    processed = template.replace("{model_name}", model_name).replace("{vllm_url}", vllm_url)
+    processed = template.replace("{model_name}", model_name).replace("{vllm_url}", vllm_url).replace("{model_name_lower}", model_name.lower())
     return processed
 
 async def send_deployment_request(yaml_content: str, namespace: str, name: str) -> Dict[str, Any]:
