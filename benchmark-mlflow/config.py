@@ -11,7 +11,6 @@ except ImportError:
 # Application Configuration
 # -----------------------------------------------------------------------------
 
-NEW_MODEL_EVALUATION = int(os.getenv('NEW_MODEL_EVALUATION', '1'))
 YAML_TEMPLATE_PATH = os.getenv('YAML_TEMPLATE_PATH', 'template.yaml')
 YAML_MODEL_FILE_PATH = os.getenv('YAML_MODEL_FILE_PATH', '')
 ARGO_FILE_PATH = os.getenv('ARGO_FILE_PATH', 'argo-application.yaml')

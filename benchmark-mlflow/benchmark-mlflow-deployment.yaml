@@ -42,8 +42,6 @@ spec:
           value: "8003"
         - name: BENCHMARK_EVAL_URL
           value: "http://benchmark-eval:8004/evaluate"
-        - name: NEW_MODEL_EVALUATION
-          value: "0"
         - name: ARGO_FILE_PATH
           value: "template/applications.yaml"
         - name: ARGO_AUTO_DEPLOY

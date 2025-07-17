@@ -18,7 +18,7 @@ except ImportError:
 
 from models import ModelEvent, PollingResult, GitHubConfig
 from github_client import GitHubClient
-from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL, NEW_MODEL_EVALUATION, ARGO_AUTO_DEPLOY, ARGOCD_PROJECT_NAME, YAML_MODEL_FILE_PATH
+from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL, ARGO_AUTO_DEPLOY, ARGOCD_PROJECT_NAME, YAML_MODEL_FILE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -223,32 +223,7 @@ class MLflowManager:
                                 logger.error(f"ArgoCD Application 생성 중 오류: {ARGOCD_PROJECT_NAME} - {version.name} - {e}")
                         elif not ARGO_AUTO_DEPLOY:
                             logger.info(f"ARGO_AUTO_DEPLOY가 비활성화되어 {ARGOCD_PROJECT_NAME}의 {version.name}의 ArgoCD 프로젝트 생성을 건너뜁니다.")
-                        
-                        # benchmark-eval 서비스에 평가 요청 보내기
-                        if NEW_MODEL_EVALUATION:
-                            logger.info(f"NEW_MODEL_EVALUATION: {NEW_MODEL_EVALUATION}")
-                            try:
-                                eval_payload = {
-                                    "model_name": version.name,
-                                    "vllm_url": f"http://vllm-{version.name.replace('_', '-').replace('.', '-').lower()}.vllm:8000"
-                                }
-                                
-                                response = requests.post(
-                                    BENCHMARK_EVAL_URL,
-                                    json=eval_payload,
-                                    headers={"Content-Type": "application/json"},
-                                    timeout=10
-                                )
-                                
-                                if response.status_code == 200:
-                                    logger.info(f"평가 요청 성공: {version.name} -> {BENCHMARK_EVAL_URL}")
-                                else:
-                                    logger.warning(f"평가 요청 실패: {version.name} (status: {response.status_code})")
-                                    
-                            except Exception as e:
-                                    logger.error(f"평가 요청 중 오류: {version.name} - {e}")
-                        else:
-                            logger.info(f"NEW_MODEL_EVALUATION가 비활성화되어 {version.name}의 평가를 건너뜁니다.")
+
                     else:
                         logger.error(f"GitHub 업데이트 실패: {version.name}:{version.version} (run_id: {version.run_id})")
                 except Exception as e:
