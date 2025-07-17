@@ -7,7 +7,7 @@ from typing import Dict, Optional
 from models import GitHubConfig, GitHubFileUpdate
 from config import (ARGO_FILE_PATH, YAML_TEMPLATE_PATH, TEMPLATE_REPO_OWNER, TEMPLATE_REPO_NAME, 
                    ARGO_REPO_OWNER, ARGO_REPO_NAME, ARGOCD_PROJECT_NAME, ARGOCD_REPO_URL, ARGOCD_NAMESPACE,
-                   ARGO_PROJECT_TEMPLATE_PATH, ARGO_APPLICATION_PATH, YAML_MODEL_FILE_PATH)
+                   ARGO_PROJECT_TEMPLATE_PATH, ARGO_APPLICATION_PATH, YAML_MODEL_FILE_PATH, BENCHMARK_EVAL_URL)
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +445,7 @@ class GitHubClient:
             
             if 'vllm' in yaml_data and 'vllm' in yaml_data['vllm']:
                 # 모델 경로 업데이트
+                yaml_data['vllm']['vllm']['evalEndpoint'] = BENCHMARK_EVAL_URL
                 yaml_data['vllm']['vllm']['model'] = f"/data/local_models/{model_name_k8s}"
                 # fullnameOverride 업데이트
                 yaml_data['vllm']['fullnameOverride'] = f"vllm-{model_name_k8s}"
