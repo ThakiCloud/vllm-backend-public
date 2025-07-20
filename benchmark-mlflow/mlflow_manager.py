@@ -21,7 +21,7 @@ except ImportError:
 from models import ModelEvent, PollingResult, GitHubConfig
 from github_client import GitHubClient
 from config import (BENCHMARK_EVAL_URL, ARGO_AUTO_DEPLOY, ARGOCD_PROJECT_NAME,
-                    get_engines_to_process, get_yaml_model_file_path, ENGINE_NAMESPACE, ENGINE_PORT)
+                    get_engines_to_process, get_yaml_model_file_path, ENGINE_NAMESPACE, ENGINE_PORT, EVALUATION_ENABLED)
 
 logger = logging.getLogger(__name__)
 
@@ -243,11 +243,14 @@ class MLflowManager:
                 except Exception as e:
                     logger.error(f"GitHub 업데이트 중 오류: {e}")
                 
-                try:
-                    logger.info(f"모델 평가 요청: {version.name}:{version.version} (run_id: {version.run_id})")
-                    self._request_evaluation(version.name, version.version, engine_match)
-                except Exception as e:
-                    logger.error(f"모델 평가 요청 실패: {version.name}:{version.version} (run_id: {version.run_id}) - {e}")
+                if EVALUATION_ENABLED:
+                    try:
+                        logger.info(f"모델 평가 요청: {version.name}:{version.version} (run_id: {version.run_id})")
+                        self._request_evaluation(version.name, version.version, engine_match)
+                    except Exception as e:
+                        logger.error(f"모델 평가 요청 실패: {version.name}:{version.version} (run_id: {version.run_id}) - {e}")
+                else:
+                    logger.info(f"모델 평가 비활성화되어 {version.name}:{version.version} (run_id: {version.run_id})의 평가를 건너뜁니다.")
         
         except Exception as e:
             logger.error(f"새로운 모델 버전 확인 실패: {e}")

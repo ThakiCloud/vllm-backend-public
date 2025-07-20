@@ -80,6 +80,7 @@ ARGOCD_NAMESPACE = os.getenv('ARGOCD_NAMESPACE', ENGINE_NAMESPACE)
 
 # Argo Auto Deploy Configuration
 ARGO_AUTO_DEPLOY = int(os.getenv('ARGO_AUTO_DEPLOY', '1'))
+EVALUATION_ENABLED = int(os.getenv('EVALUATION_ENABLED', '1'))
 
 # State Management (GitHub 기반으로 전환)
 

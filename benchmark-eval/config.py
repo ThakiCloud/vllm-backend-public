@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     PORT: int = 8004
     
     # External services
-    BENCHMARK_DEPLOY_URL: str = "" #"http://benchmark-deploy:8002"
+    BENCHMARK_DEPLOY_URL: str = "http://10.7.60.71:10303"
     
     # GitHub configuration
     GITHUB_OWNER: str = ""
@@ -26,11 +26,12 @@ class Settings(BaseSettings):
     GITHUB_CONFIG_PATH: str = ""
     GITHUB_TOKEN: str = ""  # Optional for public repos
     
-    # Evaluation configuration
-    EVALUATION_DELAY_MINUTES: int = 1
-    
     # Logging configuration
     LOG_LEVEL: str = "INFO"
+    
+    # Evaluation configuration
+    EVALUATION_TRIES: int = 60
+    EVALUATION_DELAY_SECONDS: int = 60
     
     class Config:
         env_file = ".env"

@@ -7,6 +7,8 @@ import asyncio
 from typing import Dict, Any
 from config import settings
 from models import ModelRequest, EvaluationResponse, HealthResponse, DeploymentRequest
+import time
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -84,7 +86,7 @@ async def health_check():
     """Health check endpoint"""
     return HealthResponse(status="ok", service="benchmark-eval")
 
-async def execute_evaluation_after_delay(model_name: str, inference_engine_url: str, delay_minutes: int = None):
+async def execute_evaluation(model_name: str, inference_engine_url: str):
     """
     Execute evaluation after specified delay
     
@@ -94,16 +96,18 @@ async def execute_evaluation_after_delay(model_name: str, inference_engine_url: 
         delay_minutes: Delay in minutes before execution (defaults to settings value)
     """
     try:
-        if delay_minutes is None:
-            delay_minutes = settings.EVALUATION_DELAY_MINUTES
             
-        logger.info(f"Scheduled evaluation for model '{model_name}' will start in {delay_minutes} minutes")
-        
-        # Wait for specified delay
-        await asyncio.sleep(delay_minutes * 60)  # Convert minutes to seconds
-        
-        logger.info(f"Starting evaluation for model '{model_name}' after {delay_minutes} minute delay")
-        
+        logger.info(f"Scheduled evaluation for model '{model_name}'")
+        count = 0
+        while count < settings.EVALUATION_TRIES:
+            count += 1
+            logger.info(f"Checking inference engine URL: {inference_engine_url}, count: {count}/{settings.EVALUATION_TRIES}, delay: {settings.EVALUATION_DELAY_SECONDS} seconds")
+            response = requests.get(f"{inference_engine_url}/v1/models")
+            if response.status_code == 200:
+                break
+            else:
+                logger.debug(f"Error checking inference engine URL: {response.status_code}")
+            time.sleep(settings.EVALUATION_DELAY_SECONDS)
         # Load and process the template
         template = await load_evaluate_config_template()
         processed_yaml = process_template(template, model_name.replace('_', '-').replace('.', '-'), inference_engine_url)
@@ -141,20 +145,21 @@ async def create_evaluation(request: ModelRequest, background_tasks: BackgroundT
     """
     try:
         # Add the evaluation task to background tasks with configured delay
+        logger.info(f"Evaluation scheduled for model '{request.model_name}'")
+        
         background_tasks.add_task(
-            execute_evaluation_after_delay,
+            execute_evaluation,
             request.model_name,
             request.inference_engine_url
         )
         
-        delay_minutes = settings.EVALUATION_DELAY_MINUTES
-        logger.info(f"Evaluation scheduled for model '{request.model_name}' - will execute in {delay_minutes} minutes")
+        logger.info(f"Evaluation scheduled for model '{request.model_name}'")
         
         return EvaluationResponse(
-            message=f"Evaluation deployment scheduled successfully - will execute in {delay_minutes} minutes",
+            message=f"Evaluation deployment scheduled successfully",
             model_name=request.model_name,
             inference_engine_url=request.inference_engine_url,
-            deployment_response={"status": "scheduled", "delay_minutes": delay_minutes}
+            deployment_response={"status": "scheduled"}
         )
         
     except Exception as e:
@@ -163,4 +168,4 @@ async def create_evaluation(request: ModelRequest, background_tasks: BackgroundT
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8004, reload=True) 
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT, log_level="debug") 

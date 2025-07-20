@@ -205,8 +205,7 @@ def main():
         "main:app",
         host=SERVER_HOST,
         port=SERVER_PORT,
-        reload=True,
-        log_level="debug"
+        log_level="info"
     )
 
 if __name__ == "__main__":

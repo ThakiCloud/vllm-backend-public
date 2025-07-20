@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional
 class ModelRequest(BaseModel):
     """Request model for evaluation deployment"""
     model_name: str = Field(..., description="Name of the model to evaluate")
-    inference_engine_url: str = Field(..., description="URL of the inference engine service", alias="inference-engine-url")
+    inference_engine_url: str = Field(..., description="URL of the inference engine service")
     
     model_config = {
         "populate_by_name": True,  # This allows both field names and aliases
