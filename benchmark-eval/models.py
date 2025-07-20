@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional
 class ModelRequest(BaseModel):
     """Request model for evaluation deployment"""
     model_name: str = Field(..., description="Name of the model to evaluate")
-    vllm_url: str = Field(..., description="URL of the vLLM service", alias="vllm-url")
+    inference_engine_url: str = Field(..., description="URL of the inference engine service", alias="inference-engine-url")
     
     model_config = {
         "populate_by_name": True,  # This allows both field names and aliases
@@ -17,12 +17,12 @@ class ModelRequest(BaseModel):
             raise ValueError('model_name cannot be empty')
         return v.strip()
     
-    @validator('vllm_url')
-    def validate_vllm_url(cls, v):
+    @validator('inference_engine_url')
+    def validate_inference_engine_url(cls, v):
         if not v or not v.strip():
-            raise ValueError('vllm_url cannot be empty')
+            raise ValueError('inference_engine_url cannot be empty')
         if not v.startswith(('http://', 'https://')):
-            raise ValueError('vllm_url must be a valid URL')
+            raise ValueError('inference_engine_url must be a valid URL')
         return v.strip()
 
 
@@ -37,7 +37,7 @@ class EvaluationResponse(BaseModel):
     """Response model for evaluation requests"""
     message: str = Field(..., description="Success message")
     model_name: str = Field(..., description="Name of the model")
-    vllm_url: str = Field(..., description="URL of the vLLM service")
+    inference_engine_url: str = Field(..., description="URL of the inference engine service")
     deployment_response: Optional[Dict[str, Any]] = Field(None, description="Response from deployment service")
 
 

@@ -42,14 +42,14 @@ spec:
           value: "8003"
         - name: BENCHMARK_EVAL_URL
           value: "http://benchmark-eval:8004/evaluate"
+        - name: INFERENCE_ENGINE_TYPE
+          value: "all"
         - name: ARGO_FILE_PATH
           value: "template/applications.yaml"
         - name: ARGO_AUTO_DEPLOY
           value: "0"
         - name: YAML_TEMPLATE_PATH
-          value: "template/vllm.yaml"
-        - name: YAML_MODEL_FILE_PATH
-          value: ""
+          value: "template"
         - name: ARGO_APPLICATION_PATH
           value: "applications"
         - name: ARGO_PROJECT_PATH

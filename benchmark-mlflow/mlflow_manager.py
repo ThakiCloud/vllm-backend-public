@@ -6,6 +6,8 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from mlflow.tracking import MlflowClient
+import base64
+import yaml
 try:
     from mlflow.entities import ModelVersion, RegisteredModel
 except ImportError:
@@ -18,7 +20,8 @@ except ImportError:
 
 from models import ModelEvent, PollingResult, GitHubConfig
 from github_client import GitHubClient
-from config import DEFAULT_POLL_HOURS, BENCHMARK_EVAL_URL, ARGO_AUTO_DEPLOY, ARGOCD_PROJECT_NAME, YAML_MODEL_FILE_PATH
+from config import (BENCHMARK_EVAL_URL, ARGO_AUTO_DEPLOY, ARGOCD_PROJECT_NAME,
+                    get_engines_to_process, get_yaml_model_file_path, ENGINE_NAMESPACE, ENGINE_PORT)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ class MLflowManager:
         """각 모델의 가장 최신 버전만 조회 (GitHub과 비교하여 새로운 것만)"""
         new_versions = []
         existing_files = []
+        engine_matches = []
         try:
             registered_models = self.mlflow_client.search_registered_models()
             
@@ -70,47 +74,41 @@ class MLflowManager:
                         # 생성 시간 기준으로 정렬하여 가장 최신 버전 선택
                         latest_version = max(versions, key=lambda v: v.creation_timestamp)
                         
-                        # GitHub의 기존 run_id와 비교
+                        # GitHub의 기존 파일 검색 (엔진 목록 기반)
+                        
                         if self.github_client:
-                            if YAML_MODEL_FILE_PATH:
-                                yaml_file_path = f"{YAML_MODEL_FILE_PATH}/{model.name}.yaml"
-                            else:
-                                yaml_file_path = f"{model.name}.yaml"
-                            existing_file = self.github_client.get_file_content(yaml_file_path)
-                            existing_files.append(existing_file)                                
-                            if existing_file:
-                                try:
-                                    import base64
-                                    import yaml
-                                    content = base64.b64decode(existing_file['content']).decode('utf-8')
-                                    yaml_data = yaml.safe_load(content) or {}
-                                    
-                                    if 'global' in yaml_data:
-                                        existing_model_id = yaml_data['global'].get('modelid', '')
-                                        
-                                        # modelid가 같으면 스킵
-                                        current_model_id = self._extract_model_id_from_source(latest_version.source)
-                                        if existing_model_id == current_model_id:
-                                            logger.debug(f"모델 {model.name}의 modelid가 GitHub과 동일하므로 스킵: {current_model_id}")
-                                            continue
-                                        
-                                except Exception as e:
-                                    logger.warning(f"GitHub 파일 파싱 실패 ({model.name}): {e}")
-                                    # 파싱 실패시 새로운 것으로 간주
-                        else:
-                            existing_files.append(None)
-                        # 새로운 버전만 추가
-                        new_versions.append(latest_version)
-                        logger.debug(f"새로운 모델 버전 발견: {model.name}:{latest_version.version} (run_id: {latest_version.run_id})")
+                            # 처리할 엔진 목록 가져오기
+                            engines_to_check = get_engines_to_process()
+                            
+                            for engine_type in engines_to_check:
+                                existing_file = None
+                                
+                                engine_yaml_path = get_yaml_model_file_path(engine_type)
+                                
+                                if engine_yaml_path:
+                                    yaml_file_path = f"{engine_yaml_path}/{model.name}.yaml"
+                                else:
+                                    yaml_file_path = f"{model.name}.yaml"
+                                
+                                # 파일 존재 여부 확인
+                                engine_file = self.github_client.get_file_content(yaml_file_path)
+                                if engine_file:
+                                    logger.debug(f"기존 파일 발견: {yaml_file_path}")
+                                    existing_file = engine_file 
+
+                                engine_matches.append(engine_type)
+                                existing_files.append(existing_file)
+                                new_versions.append(latest_version)
+
+                        logger.info(f"최신 모델 버전: {model.name}:{latest_version.version} (run_id: {latest_version.run_id})")
                             
                 except Exception as e:
                     logger.warning(f"모델 {model.name}의 버전 조회 실패: {e}")
-                    continue
                     
         except Exception as e:
             logger.error(f"모델 버전 조회 실패: {e}")
-        
-        return new_versions, existing_files
+
+        return new_versions, existing_files, engine_matches
     
     def _get_experiment_id_from_run(self, run_id: str) -> str:
         """run_id에서 experiment_id 조회"""
@@ -154,11 +152,25 @@ class MLflowManager:
         
         try:
             # 각 모델의 최신 버전들 확인
-            latest_versions, existing_files = self._get_latest_model_versions()
+            latest_versions, existing_files, engine_matches = self._get_latest_model_versions()
             
-            for version, existing_file in zip(latest_versions, existing_files):
+            for version, existing_file, engine_match in zip(latest_versions, existing_files, engine_matches):
                 if not version.run_id:
                     continue
+                
+                if existing_file:
+                    content = base64.b64decode(existing_file['content']).decode('utf-8')
+                    yaml_data = yaml.safe_load(content) or {}
+                    
+                    if 'global' in yaml_data:
+                        existing_model_id = yaml_data['global'].get('modelid', '')
+                    
+                        # modelid가 같으면 스킵
+                        current_model_id = self._extract_model_id_from_source(version.source)
+                        if existing_model_id == current_model_id:
+                            logger.debug(f"모델 {version.name}의 modelid가 GitHub과 동일하므로 스킵: {current_model_id}")
+                            continue
+                        
                 
                 is_new = existing_file is None
                 event_type = "model_version_created" if is_new else "model_version_updated"
@@ -178,9 +190,9 @@ class MLflowManager:
                 events.append(event)
                 
                 if is_new:
-                    logger.info(f"새로운 모델 감지: {version.name}:{version.version} (run_id: {version.run_id})")
+                    logger.debug(f"새로운 모델 감지: {version.name}:{version.version} (run_id: {version.run_id})")
                 else:
-                    logger.info(f"모델 업데이트 감지: {version.name}:{version.version} (run_id: {version.run_id})")
+                    logger.debug(f"모델 업데이트 감지: {version.name}:{version.version} (run_id: {version.run_id})")
                 
                 # GitHub 레포 업데이트 (existing_file 정보 재사용)
                 try:
@@ -192,6 +204,7 @@ class MLflowManager:
                     
                     # update_yaml_models에 기존 파일 정보 전달하여 중복 호출 방지
                     success = self.github_client.update_yaml_models(
+                        engine_match,
                         version.run_id, 
                         version.name, 
                         version.version,
@@ -200,27 +213,28 @@ class MLflowManager:
                         existing_file  # 기존 파일 정보 전달
                     )
                     if success:
-                        logger.info(f"GitHub 업데이트 성공: {version.name}:{version.version} (run_id: {version.run_id})")
+                        logger.debug(f"GitHub 업데이트 성공: {version.name}:{version.version} (run_id: {version.run_id})")
                         
                         # 새로운 모델인 경우 ArgoCD 프로젝트 생성
                         if ARGO_AUTO_DEPLOY and is_new:
                             try:
                                 project_success = self.github_client.create_argo_project()
                                 if project_success:
-                                    logger.info(f"ArgoCD 프로젝트 생성 성공: {ARGOCD_PROJECT_NAME}")
+                                    logger.info(f"ArgoCD 프로젝트 생성/업데이트 성공: {ARGOCD_PROJECT_NAME}")
+                                    try:
+                                        argo_success = self.github_client.add_model_to_argo_application(engine_match, version.name)
+                                        if argo_success:
+                                            logger.info(f"ArgoCD Application 생성/업데이트 성공: {ARGOCD_PROJECT_NAME} - {version.name}")
+                                        else:
+                                            logger.error(f"ArgoCD Application 생성 실패: {ARGOCD_PROJECT_NAME} - {version.name}")
+                                    except Exception as e:
+                                        logger.error(f"ArgoCD Application 생성 중 오류: {ARGOCD_PROJECT_NAME} - {version.name} - {e}")
                                 else:
-                                    logger.warning(f"ArgoCD 프로젝트 생성 실패: {ARGOCD_PROJECT_NAME}")
+                                    logger.error(f"ArgoCD 프로젝트 생성 실패: {ARGOCD_PROJECT_NAME}")
                             except Exception as e:
                                 logger.error(f"ArgoCD 프로젝트 생성 중 오류: {ARGOCD_PROJECT_NAME} - {e}")
                             
-                            try:
-                                argo_success = self.github_client.add_model_to_argo_application(version.name)
-                                if argo_success:
-                                    logger.info(f"ArgoCD Application 생성 성공: {ARGOCD_PROJECT_NAME} - {version.name}")
-                                else:
-                                    logger.error(f"ArgoCD Application 생성 실패: {ARGOCD_PROJECT_NAME} - {version.name}")
-                            except Exception as e:
-                                logger.error(f"ArgoCD Application 생성 중 오류: {ARGOCD_PROJECT_NAME} - {version.name} - {e}")
+                            
                         elif not ARGO_AUTO_DEPLOY:
                             logger.info(f"ARGO_AUTO_DEPLOY가 비활성화되어 {ARGOCD_PROJECT_NAME}의 {version.name}의 ArgoCD 프로젝트 생성을 건너뜁니다.")
 
@@ -228,14 +242,29 @@ class MLflowManager:
                         logger.error(f"GitHub 업데이트 실패: {version.name}:{version.version} (run_id: {version.run_id})")
                 except Exception as e:
                     logger.error(f"GitHub 업데이트 중 오류: {e}")
+                
+                try:
+                    logger.info(f"모델 평가 요청: {version.name}:{version.version} (run_id: {version.run_id})")
+                    self._request_evaluation(version.name, version.version, engine_match)
+                except Exception as e:
+                    logger.error(f"모델 평가 요청 실패: {version.name}:{version.version} (run_id: {version.run_id}) - {e}")
         
         except Exception as e:
             logger.error(f"새로운 모델 버전 확인 실패: {e}")
         
         return events
     
-
-    
+    def _request_evaluation(self, model_name: str, version: str, engine_type: str) -> bool:
+        """모델 평가 요청"""
+        model_name = model_name.lower().replace("_", "-").replace(".", "-")
+        payload = {
+            "model_name": f"{engine_type}-{model_name}-{version}",
+            "inference_engine_url": f"http://{engine_type}-{model_name}.{ENGINE_NAMESPACE}:{ENGINE_PORT}"
+        }
+        logger.debug(f"모델 평가 요청 페이로드: {payload}")
+        response = requests.post(BENCHMARK_EVAL_URL, json=payload)
+        logger.debug(f"모델 평가 요청 응답: {response.json()}")
+        return response.status_code == 200
 
     def poll_once(self) -> PollingResult:
         """한 번의 폴링 실행"""

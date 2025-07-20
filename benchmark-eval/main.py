@@ -50,9 +50,9 @@ async def load_evaluate_config_template() -> str:
         logger.error(f"Error loading config from GitHub: {e}")
         raise HTTPException(status_code=500, detail=f"Error loading config: {str(e)}")
 
-def process_template(template: str, model_name: str, vllm_url: str) -> str:
+def process_template(template: str, model_name: str, inference_engine_url: str) -> str:
     """Replace placeholders in template with actual values"""
-    processed = template.replace("{model_name}", model_name).replace("{vllm_url}", vllm_url).replace("{model_name_lower}", model_name.lower())
+    processed = template.replace("{model_name}", model_name).replace("{inference_engine_url}", inference_engine_url).replace("{model_name_lower}", model_name.lower())
     return processed
 
 async def send_deployment_request(yaml_content: str, namespace: str, name: str) -> Dict[str, Any]:
@@ -84,13 +84,13 @@ async def health_check():
     """Health check endpoint"""
     return HealthResponse(status="ok", service="benchmark-eval")
 
-async def execute_evaluation_after_delay(model_name: str, vllm_url: str, delay_minutes: int = None):
+async def execute_evaluation_after_delay(model_name: str, inference_engine_url: str, delay_minutes: int = None):
     """
     Execute evaluation after specified delay
     
     Args:
         model_name: Name of the model to evaluate
-        vllm_url: URL of the vLLM service
+        inference_engine_url: URL of the inference engine service
         delay_minutes: Delay in minutes before execution (defaults to settings value)
     """
     try:
@@ -106,7 +106,7 @@ async def execute_evaluation_after_delay(model_name: str, vllm_url: str, delay_m
         
         # Load and process the template
         template = await load_evaluate_config_template()
-        processed_yaml = process_template(template, model_name.replace('_', '-').replace('.', '-'), vllm_url)
+        processed_yaml = process_template(template, model_name.replace('_', '-').replace('.', '-'), inference_engine_url)
         
         # Validate YAML
         try:
@@ -119,7 +119,7 @@ async def execute_evaluation_after_delay(model_name: str, vllm_url: str, delay_m
         deployment_response = await send_deployment_request(
             yaml_content=processed_yaml,
             namespace="default",
-            name="New vLLM Evaluation"
+            name="New Inference Engine Evaluation"
         )
         
         logger.info(f"Evaluation deployment completed for model '{model_name}': {deployment_response}")
@@ -130,10 +130,10 @@ async def execute_evaluation_after_delay(model_name: str, vllm_url: str, delay_m
 @app.post("/evaluate", response_model=EvaluationResponse)
 async def create_evaluation(request: ModelRequest, background_tasks: BackgroundTasks):
     """
-    Schedule a new vLLM evaluation deployment to run in 10 minutes
+    Schedule a new inference engine evaluation deployment to run in configurable minutes
     
     Args:
-        request: ModelRequest containing model_name and vllm_url
+        request: ModelRequest containing model_name and inference_engine_url
         background_tasks: FastAPI background tasks
         
     Returns:
@@ -144,7 +144,7 @@ async def create_evaluation(request: ModelRequest, background_tasks: BackgroundT
         background_tasks.add_task(
             execute_evaluation_after_delay,
             request.model_name,
-            request.vllm_url
+            request.inference_engine_url
         )
         
         delay_minutes = settings.EVALUATION_DELAY_MINUTES
@@ -153,7 +153,7 @@ async def create_evaluation(request: ModelRequest, background_tasks: BackgroundT
         return EvaluationResponse(
             message=f"Evaluation deployment scheduled successfully - will execute in {delay_minutes} minutes",
             model_name=request.model_name,
-            vllm_url=request.vllm_url,
+            inference_engine_url=request.inference_engine_url,
             deployment_response={"status": "scheduled", "delay_minutes": delay_minutes}
         )
         
