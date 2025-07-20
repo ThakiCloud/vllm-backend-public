@@ -285,7 +285,7 @@ class GitHubClient:
                 application_file_path = f"{ARGO_APPLICATION_PATH}/{application_name}.yaml"
             else:
                 application_file_path = f"{application_name}.yaml"
-            value_file = f"{engine_type}/{model_name}"
+            value_file = f"{model_name}"
             
             # ArgoCD Application 템플릿에서 가져오기
             template_info = self.get_argo_file_content(ARGO_FILE_PATH)
@@ -299,6 +299,7 @@ class GitHubClient:
             
             # 템플릿 placeholder 채우기
             application_content = template_content.format(
+                path=engine_type,
                 application_name=application_name,
                 project_name=project_name,
                 repo_url=repo_url,
