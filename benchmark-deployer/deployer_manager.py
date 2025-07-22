@@ -956,11 +956,13 @@ class DeployerManager:
             # 새로 배포된 VLLM의 경우 실제 Helm 릴리스 정보를 사용
             service_name = vllm_deployment_info.get("service_name", f"vllm-service-{vllm_deployment_info['deployment_id'][:8]}")
             release_name = vllm_deployment_info.get("release_name", f"vllm-{vllm_deployment_info['deployment_id'][:8]}")
+            pod_name = f"{release_name}-0"  # StatefulSet pod name is predictable
             
-            logger.info(f"Replacing placeholders: VLLM_SERVICE_NAME -> {service_name}, VLLM_DEPLOYMENT_NAME -> {release_name}")
+            logger.info(f"Replacing placeholders: VLLM_SERVICE_NAME -> {service_name}, VLLM_DEPLOYMENT_NAME -> {release_name}, VLLM_POD_NAME -> {pod_name}")
             
             yaml_content = yaml_content.replace("VLLM_DEPLOYMENT_NAME", release_name)
             yaml_content = yaml_content.replace("VLLM_SERVICE_NAME", service_name)
+            yaml_content = yaml_content.replace("VLLM_POD_NAME", pod_name)
         
         # Create deployment request
         deployment_request = DeploymentRequest(

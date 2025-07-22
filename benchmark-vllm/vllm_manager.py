@@ -66,58 +66,15 @@ class VLLMManager:
             raise
 
     async def deploy_vllm(self, config: VLLMConfig, deployment_name: Optional[str] = None) -> VLLMDeploymentResponse:
-        """Deploy vLLM server to Kubernetes"""
+        """Deploy vLLM using Kubernetes StatefulSet"""
         try:
-            if not self.initialized:
-                await self.initialize()
-            
-            # Sync with Kubernetes to ensure we have latest state
-            await self._sync_existing_resources()
-            
-            # Check for existing deployments with same configuration
-            existing_deployment = await self._find_matching_deployment(config)
-            if existing_deployment:
-                logger.info(f"Found existing deployment with matching configuration: {existing_deployment['deployment_id']}")
-                
-                # Verify the deployment is actually running in Kubernetes
-                k8s_status = await self._verify_kubernetes_deployment(existing_deployment)
-                if k8s_status:
-                    logger.info(f"Verified deployment {existing_deployment['deployment_id']} is running in Kubernetes")
-                    # Update status if needed
-                    existing_deployment["status"] = k8s_status
-                    await self._update_deployment_in_db(existing_deployment["deployment_id"], existing_deployment)
-                    
-                    return VLLMDeploymentResponse( 
-                        deployment_id=existing_deployment["deployment_id"],
-                        deployment_name=existing_deployment["deployment_name"],
-                        status=existing_deployment["status"],
-                        config=VLLMConfig(**existing_deployment["config"]),
-                        created_at=existing_deployment["created_at"],
-                        message="Reusing existing deployment with matching configuration"
-                    )
-                else:
-                    logger.warning(f"Deployment {existing_deployment['deployment_id']} not found in Kubernetes, removing from cache")
-                    # Remove from cache if not found in Kubernetes
-                    if existing_deployment["deployment_id"] in self.deployments:
-                        del self.deployments[existing_deployment["deployment_id"]]
-                    # Continue to create new deployment
-            
-            # Check for GPU resource conflicts
-            conflicting_deployments = await self._find_conflicting_deployments(config)
-            if conflicting_deployments:
-                logger.info(f"Found {len(conflicting_deployments)} conflicting deployments, stopping them...")
-                for conflicting_deployment in conflicting_deployments:
-                    await self.stop_deployment(conflicting_deployment["deployment_id"])
-                    logger.info(f"Stopped conflicting deployment: {conflicting_deployment['deployment_id']}")
-            
             deployment_id = str(uuid.uuid4())
+            
             if not deployment_name:
                 # Clean model name for Kubernetes naming using proper sanitization
                 clean_model_name = _sanitize_k8s_name(config.model_name)
-                # Use fixed deployment name based on model name and config for consistent pod naming
-                # Include key config parameters to ensure uniqueness when needed
-                config_hash = f"{config.tensor_parallel_size}-{config.gpu_resource_type}-{config.gpu_resource_count}"
-                deployment_name = f"vllm-{clean_model_name}-{config_hash}"
+                # Use simple fixed deployment name based on model name only
+                deployment_name = f"vllm-{clean_model_name}"
                 # Ensure the full deployment name is also sanitized
                 deployment_name = _sanitize_k8s_name(deployment_name)
             
