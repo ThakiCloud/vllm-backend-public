@@ -604,14 +604,15 @@ class QueueManager:
                             raise Exception("Invalid or empty VLLM configuration")
                         
                         try:
-                            # Deploy VLLM
+                            # Deploy VLLM using Helm chart
                             vllm_config = VLLMConfig(**queue_doc["vllm_config"])
-                            deployment_response = await vllm_manager.deploy_vllm(vllm_config)
+                            deployment_response = await vllm_manager.deploy_vllm_with_helm(vllm_config, request_id)
                             
                             queue_doc["deployment_id"] = deployment_response.deployment_id
+                            queue_doc["helm_release_name"] = getattr(deployment_response, 'helm_release_name', None)
                             
                             # Wait for VLLM to be ready (this can now fail after 3 attempts)
-                            logger.info(f"Waiting for VLLM deployment {deployment_response.deployment_id} to be ready...")
+                            logger.info(f"Waiting for VLLM Helm deployment {deployment_response.deployment_id} to be ready...")
                             await self._wait_for_vllm_ready(
                                 deployment_response.deployment_id,
                                 timeout=VLLM_TIMEOUT,

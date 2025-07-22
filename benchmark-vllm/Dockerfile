@@ -4,7 +4,7 @@ FROM python:3.10-slim as base
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including build tools
+# Install system dependencies including build tools, Helm CLI, and Git
 RUN apt-get update && apt-get install -y \
     curl \
     gcc \
@@ -12,7 +12,15 @@ RUN apt-get update && apt-get install -y \
     cmake \
     ninja-build \
     build-essential \
+    git \
+    wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Helm CLI
+RUN curl https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz | tar xz \
+    && mv linux-amd64/helm /usr/local/bin/helm \
+    && rm -rf linux-amd64 \
+    && helm version
 
 # Set environment variables for vLLM
 ENV VLLM_TARGET_DEVICE=cpu

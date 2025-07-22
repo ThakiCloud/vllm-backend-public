@@ -68,6 +68,17 @@ class VLLMConfig(BaseModel):
         
         return False
 
+class VLLMDeployment(BaseModel):
+    """vLLM deployment record for Helm-based deployments"""
+    deployment_id: str
+    config: VLLMConfig
+    status: str  # deploying, running, failed, stopped
+    helm_release_name: Optional[str] = None
+    namespace: str = "vllm"
+    created_at: datetime
+    updated_at: datetime
+    error_message: Optional[str] = None
+
 class VLLMDeploymentRequest(BaseModel):
     """Request model for vLLM deployment"""
     config: VLLMConfig
