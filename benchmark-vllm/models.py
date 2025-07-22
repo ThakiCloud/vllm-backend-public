@@ -83,6 +83,7 @@ class VLLMDeploymentRequest(BaseModel):
     """Request model for vLLM deployment"""
     config: VLLMConfig
     deployment_name: Optional[str] = Field(None, description="Deployment name")
+    github_token: Optional[str] = Field(None, description="GitHub token for accessing private repositories")
 
 class VLLMDeploymentResponse(BaseModel):
     """Response model for vLLM deployment"""
@@ -146,6 +147,8 @@ class QueueRequest(BaseModel):
     helm_deployment: bool = Field(False, description="Whether this is a Helm deployment")
     helm_config: Optional[Dict[str, Any]] = Field(None, description="Helm configuration for Helm deployments")
     skip_vllm_creation: bool = Field(False, description="Skip VLLM creation and use existing VLLM")
+    # GitHub integration
+    github_token: Optional[str] = Field(None, description="GitHub token for accessing private repositories (from project)")
 
 class QueueResponse(BaseModel):
     """Response model for queue operations"""

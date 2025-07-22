@@ -110,7 +110,8 @@ async def deploy_vllm(request: VLLMDeploymentRequest):
         deployment_id = request.deployment_name or f"vllm-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         response = await vllm_manager.deploy_vllm_with_helm(
             config=request.config,
-            deployment_id=deployment_id
+            deployment_id=deployment_id,
+            github_token=request.github_token
         )
         return response
     except Exception as e:

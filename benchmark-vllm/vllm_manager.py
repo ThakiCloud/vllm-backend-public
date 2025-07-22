@@ -54,7 +54,7 @@ class VLLMManager:
         except Exception as e:
             logger.warning(f"Could not list namespaces: {e}")
     
-    async def deploy_vllm_with_helm(self, config: VLLMConfig, deployment_id: str) -> VLLMDeploymentResponse:
+    async def deploy_vllm_with_helm(self, config: VLLMConfig, deployment_id: str, github_token: Optional[str] = None) -> VLLMDeploymentResponse:
         """Deploy vLLM using Helm chart instead of hardcoded templates"""
         try:
             logger.info(f"Starting Helm-based vLLM deployment: {deployment_id}")
@@ -73,7 +73,7 @@ class VLLMManager:
             
             try:
                 # Deploy using Helm
-                chart_path = self._get_vllm_chart_path()
+                chart_path = self._get_vllm_chart_path(github_token)
                 await self._helm_install(release_name, chart_path, namespace, values_file)
                 
                 # Create deployment record
@@ -213,7 +213,7 @@ class VLLMManager:
         
         return values
     
-    def _get_vllm_chart_path(self) -> str:
+    def _get_vllm_chart_path(self, github_token: Optional[str] = None) -> str:
         """Get the path to the vLLM Helm chart"""
         # Look for the chart in the expected location
         possible_paths = [
@@ -230,20 +230,23 @@ class VLLMManager:
         
         # If not found, try to clone the charts repository
         logger.warning("vLLM chart not found locally, attempting to clone charts repository")
-        return self._clone_charts_repository()
+        return self._clone_charts_repository(github_token)
     
-    def _clone_charts_repository(self) -> str:
+    def _clone_charts_repository(self, github_token: Optional[str] = None) -> str:
         """Clone the charts repository to get the vLLM chart"""
         try:
             charts_dir = "/tmp/thaki-charts"
             if os.path.exists(charts_dir):
                 subprocess.run(["rm", "-rf", charts_dir], check=True)
             
-            # Get GitHub token from environment
-            github_token = os.getenv("GITHUB_TOKEN")
+            # Use provided GitHub token, fallback to environment variable
+            if not github_token:
+                github_token = os.getenv("GITHUB_TOKEN")
+            
             if github_token:
-                # Clone with authentication
+                # Clone with authentication for private repositories
                 clone_url = f"https://{github_token}@github.com/ThakiCloud/charts.git"
+                logger.info("Using GitHub token for private repository access")
             else:
                 # Fallback to public access (will fail for private repos)
                 clone_url = "https://github.com/ThakiCloud/charts.git"

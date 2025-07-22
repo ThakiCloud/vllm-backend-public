@@ -1107,15 +1107,34 @@ class DeployerManager:
             
             logger.info(f"Starting VLLM Helm deployment: {request.vllm_helm_config.release_name}")
             
-            # First, register this Helm deployment request in the benchmark-vllm queue
-            queue_request_id = await self._register_helm_deployment_in_queue(request)
+            # Get GitHub token first for queue registration
+            github_token = None
+            if request.vllm_helm_config.project_id:
+                logger.info(f"Fetching GitHub token for project: {request.vllm_helm_config.project_id}")
+                from config import BENCHMARK_MANAGER_URL
+                async with aiohttp.ClientSession() as session:
+                    project_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}"
+                    async with session.get(project_url) as response:
+                        if response.status == 200:
+                            project_data = await response.json()
+                            # Manager returns ProjectWithStats, so github_token is in project.github_token
+                            project_info = project_data.get('project', {})
+                            github_token = project_info.get('github_token')
+                            if github_token:
+                                logger.info(f"Retrieved GitHub token for project {request.vllm_helm_config.project_id}")
+                            else:
+                                logger.warning(f"No GitHub token found in project {request.vllm_helm_config.project_id}")
+                        else:
+                            logger.warning(f"Failed to fetch project information: {response.status}")
             
-            # Get custom values file content if specified
+            # First, register this Helm deployment request in the benchmark-vllm queue
+            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token)
+            
+            # Get custom values file content if specified (GitHub token already retrieved above)
             values_content = None
             if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
                 logger.info(f"Fetching custom values file: {request.vllm_helm_config.values_file_id}")
                 
-                # Call benchmark-manager API to get file content
                 from config import BENCHMARK_MANAGER_URL
                 async with aiohttp.ClientSession() as session:
                     file_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}/files/{request.vllm_helm_config.values_file_id}"
@@ -1341,7 +1360,7 @@ class DeployerManager:
             logger.error(f"VLLM Helm deployment failed: {e}")
             raise Exception(f"VLLM Helm deployment failed: {str(e)}")
 
-    async def _register_helm_deployment_in_queue(self, request: VLLMHelmDeploymentRequest):
+    async def _register_helm_deployment_in_queue(self, request: VLLMHelmDeploymentRequest, github_token: str = None):
         """Register Helm deployment request in the benchmark-vllm queue for visibility"""
         try:
             import aiohttp
@@ -1362,7 +1381,9 @@ class DeployerManager:
                 "vllm_yaml_content": None,
                 # Add Helm-specific metadata
                 "helm_deployment": True,
-                "helm_config": request.vllm_helm_config.dict()
+                "helm_config": request.vllm_helm_config.dict(),
+                # Add GitHub token for private repository access
+                "github_token": github_token
             }
             
             async with aiohttp.ClientSession() as session:

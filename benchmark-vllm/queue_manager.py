@@ -71,7 +71,9 @@ class QueueManager:
                 "helm_deployment": getattr(queue_request, 'helm_deployment', False),
                 "helm_config": getattr(queue_request, 'helm_config', None),
                 # Add skip_vllm_creation field
-                "skip_vllm_creation": getattr(queue_request, 'skip_vllm_creation', False)
+                "skip_vllm_creation": getattr(queue_request, 'skip_vllm_creation', False),
+                # Add GitHub token for private repository access
+                "github_token": getattr(queue_request, 'github_token', None)
             }
             
             # Store in memory
@@ -606,7 +608,8 @@ class QueueManager:
                         try:
                             # Deploy VLLM using Helm chart
                             vllm_config = VLLMConfig(**queue_doc["vllm_config"])
-                            deployment_response = await vllm_manager.deploy_vllm_with_helm(vllm_config, request_id)
+                            github_token = queue_doc.get("github_token")  # Get GitHub token from queue
+                            deployment_response = await vllm_manager.deploy_vllm_with_helm(vllm_config, request_id, github_token)
                             
                             queue_doc["deployment_id"] = deployment_response.deployment_id
                             queue_doc["helm_release_name"] = getattr(deployment_response, 'helm_release_name', None)
