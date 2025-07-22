@@ -239,10 +239,19 @@ class VLLMManager:
             if os.path.exists(charts_dir):
                 subprocess.run(["rm", "-rf", charts_dir], check=True)
             
-            # Clone the repository (assuming it's accessible)
+            # Get GitHub token from environment
+            github_token = os.getenv("GITHUB_TOKEN")
+            if github_token:
+                # Clone with authentication
+                clone_url = f"https://{github_token}@github.com/ThakiCloud/charts.git"
+            else:
+                # Fallback to public access (will fail for private repos)
+                clone_url = "https://github.com/ThakiCloud/charts.git"
+                logger.warning("No GitHub token found, attempting public clone")
+            
             clone_cmd = [
                 "git", "clone", 
-                "https://github.com/ThakiCloud/charts.git",
+                clone_url,
                 charts_dir
             ]
             subprocess.run(clone_cmd, check=True, capture_output=True)

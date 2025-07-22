@@ -53,6 +53,11 @@ spec:
           value: "true"
         - name: QUEUE_SCHEDULER_POLL_INTERVAL
           value: "30"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: benchmark-shared-secrets
+              key: GITHUB_TOKEN
         volumeMounts:
         - name: config-volume
           mountPath: /app/configs
