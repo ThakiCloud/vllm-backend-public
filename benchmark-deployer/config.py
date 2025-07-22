@@ -36,4 +36,19 @@ MONGO_URL = os.getenv(
 
 # Database and Collection Names
 DB_NAME = "deploy_db"
-DEPLOYMENTS_COLLECTION = "deployments" 
+DEPLOYMENTS_COLLECTION = "deployments"
+
+# -----------------------------------------------------------------------------
+# Service URLs
+# -----------------------------------------------------------------------------
+
+# Benchmark Services URLs
+BENCHMARK_VLLM_URL = os.getenv(
+    "BENCHMARK_VLLM_URL",
+    "http://benchmark-vllm:8005"
+)
+
+BENCHMARK_MANAGER_URL = os.getenv(
+    "BENCHMARK_MANAGER_URL", 
+    "http://benchmark-manager:8001"
+) 
