@@ -9,10 +9,19 @@ SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8001
 
 # MongoDB Configuration
-MONGO_URL = os.getenv(
-    "MONGO_URL", 
-    "mongodb://admin:password123@mongo-service:27017/?replicaSet=rs0&authSource=admin"
-)
+# Environment-aware configuration:
+# - Local development: localhost with port-forward
+# - Kubernetes deployment: cluster service names
+def get_default_mongo_url():
+    # Check if running in Kubernetes (common indicators)
+    if os.getenv("KUBERNETES_SERVICE_HOST") or os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount"):
+        # Running in Kubernetes - use cluster service names
+        return "mongodb://admin:password@mongo-0.mongo-service:27017,mongo-1.mongo-service:27017,mongo-2.mongo-service:27017/?replicaSet=rs0&authSource=admin"
+    else:
+        # Local development - use localhost with port-forward
+        return "mongodb://admin:password@localhost:27017/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000"
+
+MONGO_URL = os.getenv("MONGO_URL", get_default_mongo_url())
 DB_NAME = "manage_db"
 
 # Collection Names

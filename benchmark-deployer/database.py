@@ -25,7 +25,8 @@ async def connect_to_mongo():
     try:
         db.client = motor.motor_asyncio.AsyncIOMotorClient(
             MONGO_URL,
-            read_preference=ReadPreference.SECONDARY_PREFERRED
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000
         )
         db.db = db.client[DB_NAME]
         
@@ -62,7 +63,8 @@ async def create_indexes():
         
     except Exception as e:
         logger.error(f"Error creating indexes: {e}")
-        raise
+        # Don't raise - indexes are not critical for basic functionality
+        # raise
 
 async def check_mongo_health():
     """Check MongoDB connection health."""
@@ -77,6 +79,10 @@ async def check_mongo_health():
 # -----------------------------------------------------------------------------
 # Database Access Functions
 # -----------------------------------------------------------------------------
+
+def get_database():
+    """Get database instance."""
+    return db.db
 
 def get_deployments_collection():
     """Get deployments collection."""
