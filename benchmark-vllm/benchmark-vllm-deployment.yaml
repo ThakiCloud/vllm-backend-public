@@ -28,7 +28,10 @@ spec:
         - name: SERVER_PORT
           value: "8005"
         - name: MONGO_URL
-          value: "mongodb://admin:password123@mongo-service:27017/?replicaSet=rs0&authSource=admin"
+          valueFrom:
+            secretKeyRef:
+              name: benchmark-shared-secrets
+              key: MONGO_URL
         - name: DATABASE_NAME
           value: "benchmark_vllm"
         - name: VLLM_CONFIG_DIR
