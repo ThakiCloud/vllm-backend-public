@@ -26,6 +26,9 @@ class VLLMConfig(BaseModel):
         "enforce-eager": True,
         "disable-custom-all-reduce": True
     }, description="Additional vLLM arguments")
+    # Custom Helm values file support
+    custom_values_path: Optional[str] = Field(None, description="Path to custom Helm values YAML file")
+    custom_values_content: Optional[str] = Field(None, description="Raw custom Helm values YAML content")
 
     def get_resource_key(self) -> str:
         """Get a unique key for GPU resource identification"""

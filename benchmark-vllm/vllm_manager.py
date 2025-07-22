@@ -82,13 +82,26 @@ class VLLMManager:
             release_name = self._generate_helm_release_name(config, deployment_id)
             namespace = getattr(config, 'namespace', 'vllm')
             
-            # Create Helm values from vLLM config
-            helm_values = self._create_helm_values_from_config(config)
-            
-            # Write values to temporary file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                yaml.dump(helm_values, f, default_flow_style=False)
-                values_file = f.name
+            # Create Helm values from vLLM config or use custom values
+            if config.custom_values_content:
+                # Use provided custom values content
+                logger.info("Using custom values content provided in config")
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                    f.write(config.custom_values_content)
+                    values_file = f.name
+            elif config.custom_values_path and os.path.exists(config.custom_values_path):
+                # Use custom values file
+                logger.info(f"Using custom values file: {config.custom_values_path}")
+                values_file = config.custom_values_path
+            else:
+                # Generate values from config (existing behavior)
+                logger.info("Generating Helm values from VLLMConfig")
+                helm_values = self._create_helm_values_from_config(config, deployment_id)
+                
+                # Write values to temporary file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                    yaml.dump(helm_values, f, default_flow_style=False)
+                    values_file = f.name
             
             try:
                 # Deploy using Helm
@@ -119,8 +132,12 @@ class VLLMManager:
                 )
                 
             finally:
-                # Clean up temporary values file
-                os.unlink(values_file)
+                # Clean up temporary values file (only if we created it)
+                if config.custom_values_content or (not config.custom_values_path):
+                    try:
+                        os.unlink(values_file)
+                    except (FileNotFoundError, OSError):
+                        pass  # File might not exist or already deleted
                 
         except Exception as e:
             logger.error(f"Failed to deploy vLLM with Helm: {e}")
@@ -136,8 +153,12 @@ class VLLMManager:
         
         return f"vllm-{model_name}-{short_id}-{gpu_type}-{gpu_count}"
     
-    def _create_helm_values_from_config(self, config: VLLMConfig) -> Dict[str, Any]:
+    def _create_helm_values_from_config(self, config: VLLMConfig, deployment_id: str) -> Dict[str, Any]:
         """Convert VLLMConfig to Helm values"""
+        # Create unique name for services/PVC but keep pod name predictable
+        short_id = deployment_id[:8]
+        unique_name = f"vllm-{config.served_model_name}-{short_id}"
+        
         values = {
             "replicaCount": 1,
             "image": {
@@ -145,7 +166,9 @@ class VLLMManager:
                 "tag": "v0.9.1",
                 "pullPolicy": "IfNotPresent"
             },
-            "fullnameOverride": f"vllm-{config.served_model_name}",
+            "fullnameOverride": unique_name,
+            # Add custom pod naming to keep pod name consistent
+            "podNameOverride": f"vllm-{config.served_model_name}",
             "service": {
                 "type": "ClusterIP",
                 "port": config.port,

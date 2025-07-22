@@ -1147,10 +1147,16 @@ class DeployerManager:
                             logger.warning(f"Failed to fetch project information: {response.status}")
             
             # First, register this Helm deployment request in the benchmark-vllm queue
-            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token)
+            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token, values_content)
             
             # Get custom values file content if specified (GitHub token already retrieved above)
             values_content = None
+            if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
+                values_content = await self._get_values_file_content(
+                    request.vllm_helm_config.project_id, 
+                    request.vllm_helm_config.values_file_id,
+                    github_token
+                )
             if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
                 logger.info(f"Fetching custom values file: {request.vllm_helm_config.values_file_id}")
                 
@@ -1379,7 +1385,7 @@ class DeployerManager:
             logger.error(f"VLLM Helm deployment failed: {e}")
             raise Exception(f"VLLM Helm deployment failed: {str(e)}")
 
-    async def _register_helm_deployment_in_queue(self, request: VLLMHelmDeploymentRequest, github_token: str = None):
+    async def _register_helm_deployment_in_queue(self, request: VLLMHelmDeploymentRequest, github_token: str = None, values_content: str = None):
         """Register Helm deployment request in the benchmark-vllm queue for visibility"""
         try:
             import aiohttp
@@ -1399,9 +1405,15 @@ class DeployerManager:
                             repository_url = project_info.get('repository_url')
                             logger.info(f"Retrieved repository URL: {repository_url}")
             
+            # Add custom values to vllm_config if available
+            vllm_config_dict = request.vllm_config.dict() if request.vllm_config else {}
+            if values_content:
+                vllm_config_dict["custom_values_content"] = values_content
+                logger.info(f"Added custom values content to VLLM config for queue (size: {len(values_content)} chars)")
+            
             # Prepare queue request data compatible with benchmark-vllm QueueRequest model
             queue_request_data = {
-                "vllm_config": request.vllm_config,
+                "vllm_config": vllm_config_dict,
                 "benchmark_configs": request.benchmark_configs or [],
                 "scheduling_config": request.scheduling_config or {
                     "immediate": True,
