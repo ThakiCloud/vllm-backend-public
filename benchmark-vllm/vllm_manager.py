@@ -14,6 +14,25 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def convert_github_api_to_clone_url(api_url: str) -> str:
+    """Convert GitHub API URL to git clone URL"""
+    if not api_url:
+        return api_url
+    
+    # Handle API URL format: https://api.github.com/repos/owner/repo
+    if "api.github.com/repos/" in api_url:
+        # Extract owner/repo from API URL
+        parts = api_url.replace("https://api.github.com/repos/", "").strip("/")
+        if "/" in parts:
+            return f"https://github.com/{parts}.git"
+    
+    # If already a clone URL, return as is
+    if api_url.endswith('.git'):
+        return api_url
+    
+    # Default fallback
+    return api_url
+
 class VLLMManager:
     def __init__(self):
         self.k8s_client = None
@@ -54,7 +73,7 @@ class VLLMManager:
         except Exception as e:
             logger.warning(f"Could not list namespaces: {e}")
     
-    async def deploy_vllm_with_helm(self, config: VLLMConfig, deployment_id: str, github_token: Optional[str] = None) -> VLLMDeploymentResponse:
+    async def deploy_vllm_with_helm(self, config: VLLMConfig, deployment_id: str, github_token: Optional[str] = None, repository_url: Optional[str] = None) -> VLLMDeploymentResponse:
         """Deploy vLLM using Helm chart instead of hardcoded templates"""
         try:
             logger.info(f"Starting Helm-based vLLM deployment: {deployment_id}")
@@ -73,7 +92,7 @@ class VLLMManager:
             
             try:
                 # Deploy using Helm
-                chart_path = self._get_vllm_chart_path(github_token)
+                chart_path = self._get_vllm_chart_path(github_token, repository_url)
                 await self._helm_install(release_name, chart_path, namespace, values_file)
                 
                 # Create deployment record
@@ -213,7 +232,7 @@ class VLLMManager:
         
         return values
     
-    def _get_vllm_chart_path(self, github_token: Optional[str] = None) -> str:
+    def _get_vllm_chart_path(self, github_token: Optional[str] = None, repository_url: Optional[str] = None) -> str:
         """Get the path to the vLLM Helm chart"""
         # Look for the chart in the expected location
         possible_paths = [
@@ -230,9 +249,9 @@ class VLLMManager:
         
         # If not found, try to clone the charts repository
         logger.warning("vLLM chart not found locally, attempting to clone charts repository")
-        return self._clone_charts_repository(github_token)
+        return self._clone_charts_repository(github_token, repository_url)
     
-    def _clone_charts_repository(self, github_token: Optional[str] = None) -> str:
+    def _clone_charts_repository(self, github_token: Optional[str] = None, repository_url: Optional[str] = None) -> str:
         """Clone the charts repository to get the vLLM chart"""
         try:
             charts_dir = "/tmp/thaki-charts"
@@ -243,13 +262,24 @@ class VLLMManager:
             if not github_token:
                 github_token = os.getenv("GITHUB_TOKEN")
             
-            if github_token:
-                # Clone with authentication for private repositories
-                clone_url = f"https://{github_token}@github.com/ThakiCloud/charts.git"
-                logger.info("Using GitHub token for private repository access")
+            # Determine the clone URL
+            if repository_url:
+                # Convert GitHub API URL to clone URL if needed
+                clone_url = convert_github_api_to_clone_url(repository_url)
+                logger.info(f"Using provided repository URL: {repository_url} -> {clone_url}")
             else:
-                # Fallback to public access (will fail for private repos)
+                # Fallback to hardcoded URL (will likely fail)
                 clone_url = "https://github.com/ThakiCloud/charts.git"
+                logger.warning("No repository URL provided, using hardcoded fallback")
+            
+            # Add authentication token if available
+            if github_token and not clone_url.startswith("https://"):
+                logger.warning("Cannot add authentication to non-HTTPS URL")
+            elif github_token:
+                # Insert token into HTTPS URL
+                clone_url = clone_url.replace("https://", f"https://{github_token}@")
+                logger.info("Added GitHub token for private repository access")
+            else:
                 logger.warning("No GitHub token found, attempting public clone")
             
             clone_cmd = [

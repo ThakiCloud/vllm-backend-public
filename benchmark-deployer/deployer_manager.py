@@ -5,6 +5,25 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 import uuid
 
+def convert_github_api_to_clone_url(api_url: str) -> str:
+    """Convert GitHub API URL to git clone URL"""
+    if not api_url:
+        return api_url
+    
+    # Handle API URL format: https://api.github.com/repos/owner/repo
+    if "api.github.com/repos/" in api_url:
+        # Extract owner/repo from API URL
+        parts = api_url.replace("https://api.github.com/repos/", "").strip("/")
+        if "/" in parts:
+            return f"https://github.com/{parts}.git"
+    
+    # If already a clone URL, return as is
+    if api_url.endswith('.git'):
+        return api_url
+    
+    # Default fallback
+    return api_url
+
 # Import our modules
 from config import DEFAULT_NAMESPACE, LOG_LEVEL, JOB_MAX_FAILURES, JOB_FAILURE_RETRY_DELAY, JOB_TIMEOUT
 from models import (
@@ -1364,9 +1383,21 @@ class DeployerManager:
         """Register Helm deployment request in the benchmark-vllm queue for visibility"""
         try:
             import aiohttp
-            from config import BENCHMARK_VLLM_URL
+            from config import BENCHMARK_VLLM_URL, BENCHMARK_MANAGER_URL
             
             logger.info("Registering Helm deployment in benchmark-vllm queue...")
+            
+            # Get project repository URL if project_id is provided
+            repository_url = None
+            if request.vllm_helm_config.project_id:
+                async with aiohttp.ClientSession() as session:
+                    project_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}"
+                    async with session.get(project_url) as response:
+                        if response.status == 200:
+                            project_data = await response.json()
+                            project_info = project_data.get('project', {})
+                            repository_url = project_info.get('repository_url')
+                            logger.info(f"Retrieved repository URL: {repository_url}")
             
             # Prepare queue request data compatible with benchmark-vllm QueueRequest model
             queue_request_data = {
@@ -1383,7 +1414,9 @@ class DeployerManager:
                 "helm_deployment": True,
                 "helm_config": request.vllm_helm_config.dict(),
                 # Add GitHub token for private repository access
-                "github_token": github_token
+                "github_token": github_token,
+                # Add repository URL for charts cloning
+                "repository_url": repository_url
             }
             
             async with aiohttp.ClientSession() as session:

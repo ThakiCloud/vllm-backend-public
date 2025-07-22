@@ -149,6 +149,7 @@ class QueueRequest(BaseModel):
     skip_vllm_creation: bool = Field(False, description="Skip VLLM creation and use existing VLLM")
     # GitHub integration
     github_token: Optional[str] = Field(None, description="GitHub token for accessing private repositories (from project)")
+    repository_url: Optional[str] = Field(None, description="GitHub repository URL for charts cloning")
 
 class QueueResponse(BaseModel):
     """Response model for queue operations"""
