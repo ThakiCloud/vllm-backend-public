@@ -1031,6 +1031,45 @@ class DeployerManager:
         )
         logger.info(f"Marked queue request {queue_request_id} as failed: {error_message}")
 
+    async def _ensure_latest_charts(self, chart_dir="/tmp/charts"):
+        """Ensure we have the latest charts from GitHub"""
+        import subprocess
+        import os
+        import shutil
+        
+        try:
+            logger.info("Updating Helm charts from GitHub...")
+            
+            # Remove existing chart directory if it exists
+            if os.path.exists(chart_dir):
+                shutil.rmtree(chart_dir)
+                logger.info(f"Removed existing chart directory: {chart_dir}")
+            
+            # Clone the latest charts
+            clone_cmd = [
+                "git", "clone", 
+                "https://github.com/ThakiCloud/charts.git", 
+                chart_dir
+            ]
+            
+            result = await asyncio.create_subprocess_exec(
+                *clone_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode == 0:
+                logger.info(f"Successfully cloned charts to {chart_dir}")
+                return chart_dir
+            else:
+                logger.error(f"Failed to clone charts: {stderr.decode()}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error updating charts: {e}")
+            return None
+
     async def deploy_vllm_with_helm(self, request: VLLMHelmDeploymentRequest) -> Dict[str, Any]:
         try:
             import aiohttp
@@ -1097,6 +1136,9 @@ class DeployerManager:
                     logger.info(f"Created temporary values file: {values_file_path}")
             
             try:
+                # Ensure we have the latest charts from GitHub
+                chart_base_dir = await self._ensure_latest_charts()
+                
                 # Resolve chart path - the chart_path from request might be incorrect
                 # For VLLM deployments, we need to use a standard chart location
                 requested_chart_path = request.vllm_helm_config.chart_path
@@ -1107,16 +1149,31 @@ class DeployerManager:
                 possible_chart_paths = [
                     # Try the requested path first
                     requested_chart_path,
-                    # Try common local locations
+                ]
+                
+                # Add GitHub cloned chart path if available
+                if chart_base_dir:
+                    possible_chart_paths.extend([
+                        f"{chart_base_dir}/thaki/vllm/charts/vllm",
+                        f"{chart_base_dir}/thaki/vllm",
+                    ])
+                
+                # Add fallback paths
+                possible_chart_paths.extend([
+                    # Try common local locations with correct structure
+                    "./charts/thaki/vllm/charts/vllm",
+                    "../charts/thaki/vllm/charts/vllm",
                     "./charts/vllm",
+                    "../benchmark-vllm-helm/charts/thaki/vllm/charts/vllm", 
                     "../benchmark-vllm-helm/charts/thaki/vllm", 
                     # Try absolute paths that might be mounted in containers
+                    "/charts/thaki/vllm/charts/vllm",
                     "/charts/vllm",
                     "/thaki/vllm",
                     # Try relative paths
                     "./vllm",
                     "../vllm"
-                ]
+                ])
                 
                 chart_path = None
                 for possible_path in possible_chart_paths:

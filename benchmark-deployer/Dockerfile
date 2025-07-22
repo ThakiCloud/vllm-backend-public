@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install system dependencies and tools
 RUN apt-get update && apt-get install -y \
-    gcc curl wget gnupg2 \
+    gcc curl wget gnupg2 git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl
@@ -29,16 +29,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create directory for kubeconfig
-RUN mkdir -p /root/.kube
+# Create directory for kubeconfig and temp charts
+RUN mkdir -p /root/.kube /tmp/charts
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app
+    && chown -R app:app /app \
+    && mkdir -p /home/app/.kube /home/app/tmp \
+    && chown -R app:app /home/app
 USER app
 
 # Expose port
 EXPOSE 8002
 
 # Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]  
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
