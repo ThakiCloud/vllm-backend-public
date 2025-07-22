@@ -31,8 +31,18 @@ class KubernetesClient:
                 config.load_incluster_config()
                 logger.info("Loaded in-cluster Kubernetes configuration")
             except config.ConfigException:
-                config.load_kube_config(config_file=KUBECONFIG_PATH)
-                logger.info(f"Loaded Kubernetes configuration from {KUBECONFIG_PATH}")
+                # Try to load from kubeconfig file
+                try:
+                    if KUBECONFIG_PATH and os.path.exists(KUBECONFIG_PATH):
+                        config.load_kube_config(config_file=KUBECONFIG_PATH)
+                        logger.info(f"Loaded Kubernetes configuration from {KUBECONFIG_PATH}")
+                    else:
+                        # Try default kubeconfig location
+                        config.load_kube_config()
+                        logger.info("Loaded Kubernetes configuration from default location")
+                except Exception as kube_error:
+                    logger.warning(f"No valid Kubernetes configuration found: {kube_error}")
+                    raise Exception(f"No valid Kubernetes configuration: {kube_error}")
             
             self.api_client = client.ApiClient()
             self.apps_v1 = client.AppsV1Api()
@@ -40,9 +50,13 @@ class KubernetesClient:
             self.batch_v1 = client.BatchV1Api()
             
             # Test connection
-            await self.test_connection()
-            self.is_connected = True
-            logger.info("Kubernetes client initialized successfully")
+            connection_success = await self.test_connection()
+            if connection_success:
+                self.is_connected = True
+                logger.info("Kubernetes client initialized successfully")
+            else:
+                self.is_connected = False
+                raise Exception("Kubernetes connection test failed")
             
         except Exception as e:
             logger.error(f"Failed to initialize Kubernetes client: {e}")
@@ -52,7 +66,8 @@ class KubernetesClient:
     async def test_connection(self):
         """Test Kubernetes connection."""
         try:
-            version = self.core_v1.get_api_resources()
+            # Use a simple API call to test connection
+            namespaces = self.core_v1.list_namespace(limit=1)
             logger.info("Kubernetes connection test successful")
             return True
         except Exception as e:
@@ -94,6 +109,9 @@ class KubernetesClient:
             raise Exception("Kubernetes client not connected")
 
         try:
+            # Ensure namespace exists before deploying resources
+            await self.ensure_namespace_exists(namespace)
+            
             resources = self.parse_yaml_content(yaml_content)
             deployed_resources = []
             
@@ -111,36 +129,83 @@ class KubernetesClient:
                 # Remove apiVersion and kind from resource body since they're not needed for client objects
                 resource_body = {k: v for k, v in resource.items() if k not in ['apiVersion', 'kind']}
                 
-                if kind == 'Job':
-                    body = client.V1Job(**resource_body)
-                    result = self.batch_v1.create_namespaced_job(namespace=namespace, body=body)
-                    deployed_resources.append((name, kind, resource_type))
+                try:
+                    if kind == 'Job':
+                        body = client.V1Job(**resource_body)
+                        result = self.batch_v1.create_namespaced_job(namespace=namespace, body=body)
+                        deployed_resources.append((name, kind, resource_type))
+                        
+                    elif kind == 'Deployment':
+                        body = client.V1Deployment(**resource_body)
+                        result = self.apps_v1.create_namespaced_deployment(namespace=namespace, body=body)
+                        deployed_resources.append((name, kind, resource_type))
+                        
+                    elif kind == 'Service':
+                        body = client.V1Service(**resource_body)
+                        result = self.core_v1.create_namespaced_service(namespace=namespace, body=body)
+                        deployed_resources.append((name, kind, resource_type))
+                        
+                    elif kind == 'ConfigMap':
+                        body = client.V1ConfigMap(**resource_body)
+                        result = self.core_v1.create_namespaced_config_map(namespace=namespace, body=body)
+                        deployed_resources.append((name, kind, resource_type))
+                        
+                    elif kind == 'Secret':
+                        body = client.V1Secret(**resource_body)
+                        result = self.core_v1.create_namespaced_secret(namespace=namespace, body=body)
+                        deployed_resources.append((name, kind, resource_type))
+                        
+                    else:
+                        logger.warning(f"Unsupported resource type: {kind}")
+                        continue
                     
-                elif kind == 'Deployment':
-                    body = client.V1Deployment(**resource_body)
-                    result = self.apps_v1.create_namespaced_deployment(namespace=namespace, body=body)
-                    deployed_resources.append((name, kind, resource_type))
+                    logger.info(f"Successfully deployed {kind} '{name}' in namespace '{namespace}'")
                     
-                elif kind == 'Service':
-                    body = client.V1Service(**resource_body)
-                    result = self.core_v1.create_namespaced_service(namespace=namespace, body=body)
-                    deployed_resources.append((name, kind, resource_type))
-                    
-                elif kind == 'ConfigMap':
-                    body = client.V1ConfigMap(**resource_body)
-                    result = self.core_v1.create_namespaced_config_map(namespace=namespace, body=body)
-                    deployed_resources.append((name, kind, resource_type))
-                    
-                elif kind == 'Secret':
-                    body = client.V1Secret(**resource_body)
-                    result = self.core_v1.create_namespaced_secret(namespace=namespace, body=body)
-                    deployed_resources.append((name, kind, resource_type))
-                    
-                else:
-                    logger.warning(f"Unsupported resource type: {kind}")
-                    continue
-                
-                logger.info(f"Successfully deployed {kind} '{name}' in namespace '{namespace}'")
+                except ApiException as api_e:
+                    if api_e.status == 409:  # Conflict - resource already exists
+                        logger.warning(f"{kind} '{name}' already exists in namespace '{namespace}', attempting to handle conflict")
+                        
+                        # For Jobs, we can't update them, so we might want to delete and recreate
+                        # or just skip if it's the same job
+                        if kind == 'Job':
+                            # Check if the job is completed, if so we can delete it and create new one
+                            try:
+                                existing_job = self.batch_v1.read_namespaced_job(name=name, namespace=namespace)
+                                if existing_job.status.conditions:
+                                    # Job has completed, delete it and create new one
+                                    for condition in existing_job.status.conditions:
+                                        if condition.type in ['Complete', 'Failed']:
+                                            logger.info(f"Deleting completed/failed job '{name}' to create new one")
+                                            self.batch_v1.delete_namespaced_job(
+                                                name=name, 
+                                                namespace=namespace, 
+                                                propagation_policy='Background'
+                                            )
+                                            # Wait a moment for deletion to propagate
+                                            await asyncio.sleep(2)
+                                            # Now try to create the job again
+                                            body = client.V1Job(**resource_body)
+                                            result = self.batch_v1.create_namespaced_job(namespace=namespace, body=body)
+                                            deployed_resources.append((name, kind, resource_type))
+                                            logger.info(f"Successfully recreated {kind} '{name}' in namespace '{namespace}'")
+                                            break
+                                else:
+                                    # Job is still running, skip creation
+                                    logger.info(f"Job '{name}' is still running, skipping creation")
+                                    deployed_resources.append((name, kind, resource_type))
+                            except Exception as read_error:
+                                logger.warning(f"Could not read existing job '{name}': {read_error}")
+                                # Just skip this resource
+                                deployed_resources.append((name, kind, resource_type))
+                        
+                        else:
+                            # For other resources, we can try to update them or just skip
+                            logger.info(f"Resource '{name}' already exists, skipping creation")
+                            deployed_resources.append((name, kind, resource_type))
+                    else:
+                        # Other API errors should still be raised
+                        logger.error(f"Kubernetes API error for {kind} '{name}': {api_e}")
+                        raise api_e
             
             # Return info about the first deployed resource (usually the main one)
             if deployed_resources:
@@ -494,6 +559,89 @@ class KubernetesClient:
         except Exception as e:
             logger.error(f"Error getting job pod for terminal: {e}")
             raise
+
+    async def ensure_namespace_exists(self, namespace: str):
+        """Ensure the specified namespace exists, create it if it doesn't."""
+        try:
+            # Try to get the namespace
+            self.core_v1.read_namespace(name=namespace)
+            logger.info(f"Namespace '{namespace}' already exists")
+        except ApiException as e:
+            if e.status == 404:  # Namespace doesn't exist
+                try:
+                    # Create the namespace
+                    namespace_body = client.V1Namespace(
+                        metadata=client.V1ObjectMeta(
+                            name=namespace,
+                            labels={
+                                "created-by": "vllm-deployer",
+                                "auto-created": "true"
+                            }
+                        )
+                    )
+                    self.core_v1.create_namespace(body=namespace_body)
+                    logger.info(f"Successfully created namespace: {namespace}")
+                except ApiException as create_error:
+                    if create_error.status == 409:  # Namespace already exists (race condition)
+                        logger.info(f"Namespace '{namespace}' already exists (created by another process)")
+                    else:
+                        logger.error(f"Failed to create namespace {namespace}: {create_error}")
+                        raise Exception(f"Failed to create namespace {namespace}: {create_error}")
+            else:
+                logger.error(f"Error checking namespace {namespace}: {e}")
+                raise Exception(f"Error checking namespace {namespace}: {e}")
+
+    async def get_cluster_info(self) -> Optional[Dict[str, Any]]:
+        """Get cluster information for health checks."""
+        if not self.is_connected:
+            return None
+        
+        try:
+            # Get cluster version information
+            version_info = self.core_v1.get_api_resources()
+            
+            # Get basic cluster info
+            cluster_info = {
+                "version": "available",
+                "connected": True,
+                "api_server": "accessible"
+            }
+            
+            return cluster_info
+            
+        except Exception as e:
+            logger.error(f"Failed to get cluster info: {e}")
+            return None
+
+    async def delete_job(self, job_name: str, namespace: str = DEFAULT_NAMESPACE) -> bool:
+        """Delete a specific job by name"""
+        if not self.is_connected:
+            logger.error("Kubernetes client not connected")
+            return False
+        
+        try:
+            logger.info(f"Deleting job '{job_name}' in namespace '{namespace}'")
+            
+            # Delete the job with background propagation policy
+            self.batch_v1.delete_namespaced_job(
+                name=job_name,
+                namespace=namespace,
+                propagation_policy='Background'
+            )
+            
+            logger.info(f"Successfully deleted job '{job_name}' from namespace '{namespace}'")
+            return True
+            
+        except ApiException as e:
+            if e.status == 404:
+                logger.info(f"Job '{job_name}' not found in namespace '{namespace}' (already deleted)")
+                return True  # Consider this a success since the job is gone
+            else:
+                logger.error(f"Failed to delete job '{job_name}': {e.reason}")
+                return False
+        except Exception as e:
+            logger.error(f"Unexpected error deleting job '{job_name}': {e}")
+            return False
 
 # Create global instance
 k8s_client = KubernetesClient() 

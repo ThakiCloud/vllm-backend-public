@@ -74,6 +74,7 @@ class GitHubClient:
             
             for item in contents:
                 if (item.get("type") == "file" and 
+                    item.get("name") and
                     any(item["name"].endswith(ext) for ext in SUPPORTED_CONFIG_EXTENSIONS)):
                     
                     file_content = await self.fetch_file_content(item["path"])
@@ -100,6 +101,7 @@ class GitHubClient:
             
             for item in contents:
                 if (item.get("type") == "file" and 
+                    item.get("name") and
                     any(item["name"].endswith(ext) for ext in SUPPORTED_JOB_EXTENSIONS)):
                     
                     file_content = await self.fetch_file_content(item["path"])
@@ -115,6 +117,34 @@ class GitHubClient:
                             
         except Exception as e:
             logging.error(f"Error fetching job files: {e}")
+            
+        return files_data
+
+    async def fetch_vllm_files(self, vllm_values_path: str) -> List[Dict[str, Any]]:
+        """Fetch all custom-values*.yaml files from the specified folder."""
+        files_data = []
+        try:
+            contents = await self.fetch_folder_contents(vllm_values_path)
+            
+            for item in contents:
+                if (item.get("type") == "file" and 
+                    item.get("name") and
+                    item["name"].startswith("custom-values") and 
+                    item["name"].endswith(".yaml")):
+                    
+                    file_content = await self.fetch_file_content(item["path"])
+                    if file_content:
+                        # Store original text content without parsing
+                        files_data.append({
+                            "file_path": item["path"],
+                            "file_type": "vllm",
+                            "content": file_content["content"],  # Original text content
+                            "sha": file_content["sha"],
+                            "last_modified": datetime.now()
+                        })
+                            
+        except Exception as e:
+            logging.error(f"Error fetching VLLM files: {e}")
             
         return files_data
 

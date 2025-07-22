@@ -1,15 +1,17 @@
 import logging
 import yaml
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 import uuid
 
 # Import our modules
-from config import DEFAULT_NAMESPACE, LOG_LEVEL
+from config import DEFAULT_NAMESPACE, LOG_LEVEL, JOB_MAX_FAILURES, JOB_FAILURE_RETRY_DELAY, JOB_TIMEOUT
 from models import (
     DeploymentRequest, DeploymentResponse, LogRequest, LogResponse,
     DeleteRequest, DeleteResponse, JobStatusResponse, ResourceType,
-    TerminalSessionRequest, TerminalSessionResponse, TerminalSessionInfo, TerminalSessionListResponse
+    TerminalSessionRequest, TerminalSessionResponse, TerminalSessionInfo, TerminalSessionListResponse,
+    VLLMHelmDeploymentRequest, VLLMHelmConfig
 )
 from kubernetes_client import k8s_client
 from terminal_manager import terminal_manager
@@ -21,7 +23,9 @@ logger = logging.getLogger(__name__)
 
 class DeployerManager:
     def __init__(self):
-        pass
+        self.mongo_client = None
+        self.db = None
+        self.processing_queue = False  # 큐 처리 중인지 확인하는 플래그
 
     async def initialize(self):
         """Initialize the deployer manager."""
@@ -30,16 +34,33 @@ class DeployerManager:
             await connect_to_mongo()
             logger.info("MongoDB connection initialized")
             
+            # Initialize our own MongoDB connection for queue operations
+            from config import MONGO_URL, DB_NAME
+            import motor.motor_asyncio
+            self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
+                MONGO_URL,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=5000
+            )
+            self.db = self.mongo_client[DB_NAME]
+            logger.info("DeployerManager MongoDB connection initialized")
+            
             # Initialize Kubernetes client
             await k8s_client.initialize()
             logger.info("Deployer manager initialized with Kubernetes connection")
         except Exception as e:
-            logger.warning(f"Failed to initialize Kubernetes client: {e}. Running without Kubernetes connection.")
-            logger.info("Deployer manager initialized without Kubernetes connection")
+            logger.error(f"Failed to initialize Kubernetes client: {e}")
+            # Re-raise the exception to prevent the service from starting without Kubernetes
+            raise Exception(f"Failed to initialize deployer manager: Kubernetes client initialization failed: {str(e)}")
 
     async def deploy_yaml(self, request: DeploymentRequest) -> DeploymentResponse:
         """Deploy YAML content to Kubernetes."""
         try:
+            # Check if Kubernetes client is connected
+            if not k8s_client.is_connected:
+                logger.error("Kubernetes client is not connected. Attempting to reconnect...")
+                await k8s_client.initialize()
+                
             namespace = request.namespace or DEFAULT_NAMESPACE
             
             # Parse and deploy YAML using Kubernetes client
@@ -248,37 +269,25 @@ class DeployerManager:
     async def get_system_health(self) -> Dict[str, Any]:
         """Get system health information."""
         try:
-            # Safely get Kubernetes version
-            kubernetes_version = None
-            if k8s_client.is_connected:
-                try:
-                    kubernetes_version = await k8s_client.get_kubernetes_version()
-                except Exception as e:
-                    logger.debug(f"Could not get Kubernetes version: {e}")
+            k8s_health = await k8s_client.get_cluster_info()
             
-            # Get active deployments count from database
-            active_deployments_count = 0
-            try:
-                deployments_collection = get_deployments_collection()
-                active_deployments_count = await deployments_collection.count_documents({"status": {"$ne": "deleted"}})
-            except Exception as e:
-                logger.debug(f"Could not get active deployments count: {e}")
+            # Get active deployments count
+            deployments_collection = get_deployments_collection()
+            active_count = await deployments_collection.count_documents({"status": "deployed"})
             
             return {
-                "kubernetes_connected": k8s_client.is_connected,
-                "kubernetes_version": kubernetes_version,
-                "active_deployments": active_deployments_count,
-                "service_status": "healthy" if k8s_client.is_connected else "degraded"
+                "service_status": "healthy",
+                "kubernetes_connected": k8s_health is not None,
+                "kubernetes_version": k8s_health.get("version") if k8s_health else None,
+                "active_deployments": active_count
             }
-            
         except Exception as e:
-            logger.error(f"Failed to get system health: {e}")
+            logger.error(f"Health check failed: {e}")
             return {
+                "service_status": "unhealthy",
                 "kubernetes_connected": False,
                 "kubernetes_version": None,
-                "active_deployments": 0,
-                "service_status": "unhealthy",
-                "error": str(e)
+                "active_deployments": 0
             }
 
     # -----------------------------------------------------------------------------
@@ -392,5 +401,2010 @@ class DeployerManager:
         except Exception as e:
             logger.error(f"Failed to cleanup terminal sessions: {e}")
 
-# Create global instance
+    # -----------------------------------------------------------------------------
+    # VLLM Queue Management Methods (Integrated from benchmark-vllm)
+    # -----------------------------------------------------------------------------
+
+    async def add_vllm_to_queue(self, request: 'VLLMDeploymentQueueRequest') -> 'VLLMDeploymentQueueResponse':
+        """Add a VLLM deployment + benchmark jobs request to the queue"""
+        try:
+            import uuid
+            from models import VLLMDeploymentQueueResponse, SchedulingConfig
+            
+            queue_request_id = str(uuid.uuid4())
+            
+            # Calculate total steps: VLLM 생성을 건너뛰면 0, 아니면 1 + 벤치마크 작업 수
+            total_steps = (0 if request.skip_vllm_creation else 1) + len(request.benchmark_configs)
+            
+            # Create queue request document
+            queue_doc = {
+                "queue_request_id": queue_request_id,
+                "priority": request.priority,
+                "status": "pending",
+                "vllm_config": request.vllm_config.dict() if request.vllm_config else {},
+                "benchmark_configs": [config.dict() for config in request.benchmark_configs],
+                "scheduling_config": request.scheduling_config.dict() if request.scheduling_config else SchedulingConfig().dict(),
+                "skip_vllm_creation": request.skip_vllm_creation,
+                "created_at": datetime.now(),
+                "started_at": None,
+                "completed_at": None,
+                "vllm_deployment_id": None,
+                "benchmark_job_ids": [],
+                "current_step": "pending",
+                "total_steps": total_steps,
+                "completed_steps": 0,
+                "error_message": None
+            }
+            
+            # Store in database
+            await self._save_vllm_queue_request_to_db(queue_doc)
+            
+            logger.info(f"Added VLLM queue request {queue_request_id} with priority {request.priority}")
+            
+            return VLLMDeploymentQueueResponse(
+                queue_request_id=queue_request_id,
+                priority=request.priority,
+                status="pending",
+                vllm_config=request.vllm_config,
+                benchmark_configs=request.benchmark_configs,
+                scheduling_config=request.scheduling_config or SchedulingConfig(),
+                created_at=queue_doc["created_at"],
+                current_step="pending",
+                total_steps=total_steps,
+                completed_steps=0
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to add VLLM request to queue: {e}")
+            raise Exception(f"Failed to add VLLM request to queue: {str(e)}")
+
+    async def get_vllm_queue_list(self) -> List['VLLMDeploymentQueueResponse']:
+        """Get list of all VLLM queue requests"""
+        try:
+            from models import VLLMDeploymentQueueResponse, VLLMConfig, BenchmarkJobConfig, SchedulingConfig
+            
+            # Get queue collection
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            result = []
+            async for queue_doc in queue_collection.find().sort("created_at", -1):
+                # Handle scheduling_config properly
+                scheduling_config_data = queue_doc.get("scheduling_config", {})
+                if scheduling_config_data:
+                    scheduling_config = SchedulingConfig(**scheduling_config_data)
+                else:
+                    scheduling_config = SchedulingConfig()
+                
+                result.append(VLLMDeploymentQueueResponse(
+                    queue_request_id=queue_doc["queue_request_id"],
+                    priority=queue_doc["priority"],
+                    status=queue_doc["status"],
+                    vllm_config=VLLMConfig(**queue_doc["vllm_config"]) if queue_doc["vllm_config"] else None,
+                    benchmark_configs=[BenchmarkJobConfig(**config) for config in queue_doc["benchmark_configs"]],
+                    scheduling_config=scheduling_config,
+                    created_at=queue_doc["created_at"],
+                    started_at=queue_doc.get("started_at"),
+                    completed_at=queue_doc.get("completed_at"),
+                    vllm_deployment_id=queue_doc.get("vllm_deployment_id"),
+                    benchmark_job_ids=queue_doc.get("benchmark_job_ids", []),
+                    current_step=queue_doc.get("current_step", "pending"),
+                    total_steps=queue_doc.get("total_steps", 1),
+                    completed_steps=queue_doc.get("completed_steps", 0),
+                    error_message=queue_doc.get("error_message")
+                ))
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to get VLLM queue list: {e}")
+            raise Exception(f"Failed to get VLLM queue list: {str(e)}")
+
+    async def get_vllm_queue_status(self) -> 'VLLMQueueStatusResponse':
+        """Get VLLM queue status overview"""
+        try:
+            from models import VLLMQueueStatusResponse
+            
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            status_counts = {
+                "pending": 0,
+                "processing": 0, 
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0
+            }
+            
+            async for queue_doc in queue_collection.find():
+                status = queue_doc["status"]
+                if status in status_counts:
+                    status_counts[status] += 1
+            
+            return VLLMQueueStatusResponse(
+                total_requests=sum(status_counts.values()),
+                pending_requests=status_counts["pending"],
+                processing_requests=status_counts["processing"],
+                completed_requests=status_counts["completed"],
+                failed_requests=status_counts["failed"],
+                cancelled_requests=status_counts["cancelled"]
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to get VLLM queue status: {e}")
+            raise Exception(f"Failed to get VLLM queue status: {str(e)}")
+
+    async def cancel_vllm_queue_request(self, queue_request_id: str) -> bool:
+        """Cancel a VLLM queue request and clean up resources"""
+        try:
+            logger.info(f"Attempting to cancel VLLM queue request {queue_request_id}")
+            
+            # Get queue collection
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            # Find the queue request
+            queue_request = await queue_collection.find_one({"queue_request_id": queue_request_id})
+            if not queue_request:
+                logger.warning(f"Queue request {queue_request_id} not found")
+                return False
+            
+            # Only allow cancellation of pending or processing requests
+            if queue_request.get("status") not in ["pending", "processing"]:
+                logger.warning(f"Cannot cancel queue request {queue_request_id} with status {queue_request.get('status')}")
+                return False
+            
+            logger.info(f"Cancelling queue request {queue_request_id} with status {queue_request.get('status')}")
+            
+            # Clean up resources if processing
+            if queue_request.get("status") == "processing":
+                await self._cleanup_processing_vllm_request(queue_request_id, queue_request)
+            
+            # Update status to cancelled
+            await queue_collection.update_one(
+                {"queue_request_id": queue_request_id},
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "completed_at": datetime.now(),
+                        "error_message": "Cancelled by user"
+                    }
+                }
+            )
+            
+            logger.info(f"Successfully cancelled VLLM queue request {queue_request_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error cancelling VLLM queue request {queue_request_id}: {e}")
+            return False
+
+    async def _cleanup_processing_vllm_request(self, queue_request_id: str, queue_request: dict):
+        """Clean up resources for a processing VLLM request"""
+        try:
+            logger.info(f"Cleaning up processing VLLM request {queue_request_id}")
+            
+            # 1. Clean up benchmark jobs using multiple methods
+            await self._cleanup_benchmark_jobs_comprehensive(queue_request_id, queue_request)
+            
+            # 2. Clean up VLLM deployment if it was created by this request
+            await self._cleanup_vllm_deployment_for_request(queue_request_id, queue_request)
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup of processing VLLM request {queue_request_id}: {e}")
+
+    async def _cleanup_benchmark_jobs_comprehensive(self, queue_request_id: str, queue_request: dict):
+        """Comprehensive cleanup of benchmark jobs using multiple methods"""
+        try:
+            # Method 1: Clean up using benchmark_job_ids (existing method)
+            benchmark_job_ids = queue_request.get("benchmark_job_ids", [])
+            if benchmark_job_ids:
+                logger.info(f"Cleaning up {len(benchmark_job_ids)} benchmark jobs by job IDs")
+                for job_id in benchmark_job_ids:
+                    try:
+                        # Try to get job name from deployments collection
+                        deployments_collection = get_deployments_collection()
+                        deployment_doc = await deployments_collection.find_one({"deployment_id": job_id})
+                        
+                        if deployment_doc:
+                            job_name = deployment_doc.get("resource_name")
+                            namespace = deployment_doc.get("namespace", "default")
+                            
+                            if job_name:
+                                logger.info(f"Deleting benchmark job {job_name} in namespace {namespace}")
+                                await self.delete_job(job_name, namespace)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up benchmark job {job_id}: {e}")
+                        continue
+            
+            # Method 2: Clean up using created_job_names if available
+            created_job_names = queue_request.get("created_job_names", [])
+            if created_job_names:
+                logger.info(f"Cleaning up {len(created_job_names)} jobs by stored names")
+                for job_info in created_job_names:
+                    try:
+                        if isinstance(job_info, dict):
+                            job_name = job_info.get('name')
+                            namespace = job_info.get('namespace', 'default')
+                        else:
+                            job_name = job_info
+                            namespace = 'default'
+                        
+                        if job_name:
+                            logger.info(f"Deleting stored job {job_name} in namespace {namespace}")
+                            await self.delete_job(job_name, namespace)
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up stored job {job_info}: {e}")
+                        continue
+            
+            # Method 3: Search for jobs related to this queue request
+            await self._cleanup_jobs_by_pattern(queue_request_id)
+            
+        except Exception as e:
+            logger.error(f"Error during comprehensive benchmark job cleanup: {e}")
+
+    async def _cleanup_jobs_by_pattern(self, queue_request_id: str):
+        """Search and clean up jobs that might be related to this queue request"""
+        try:
+            logger.info(f"Searching for jobs related to queue request {queue_request_id}")
+            
+            # Get all active deployments and look for jobs that might be related
+            deployments_collection = get_deployments_collection()
+            
+            # Find jobs that might be related (by name patterns or timing)
+            related_jobs = await deployments_collection.find({
+                "resource_type": {"$in": ["job", "Job"]},
+                "status": {"$nin": ["deleted", "completed"]},
+                "$or": [
+                    {"resource_name": {"$regex": f".*{queue_request_id[:8]}.*", "$options": "i"}},  # Partial UUID match
+                    {"resource_name": {"$regex": "benchmark.*", "$options": "i"}},  # Benchmark pattern
+                    {"yaml_content": {"$regex": f".*{queue_request_id}.*", "$options": "i"}}  # Queue ID in YAML
+                ]
+            }).to_list(length=None)
+            
+            if related_jobs:
+                logger.info(f"Found {len(related_jobs)} potentially related jobs for cleanup")
+                for job_doc in related_jobs:
+                    try:
+                        job_name = job_doc.get("resource_name")
+                        namespace = job_doc.get("namespace", "default")
+                        
+                        if job_name:
+                            logger.info(f"Deleting potentially related job {job_name} in namespace {namespace}")
+                            await self.delete_job(job_name, namespace)
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up related job {job_doc.get('resource_name')}: {e}")
+                        continue
+            else:
+                logger.info(f"No additional related jobs found for queue request {queue_request_id}")
+                
+        except Exception as e:
+            logger.warning(f"Error during pattern-based job cleanup: {e}")
+
+    async def _cleanup_vllm_deployment_for_request(self, queue_request_id: str, queue_request: dict):
+        """Clean up VLLM deployment if it was created by this request"""
+        try:
+            vllm_deployment_id = queue_request.get("vllm_deployment_id")
+            if vllm_deployment_id and vllm_deployment_id != "existing-vllm":
+                logger.info(f"Cleaning up VLLM deployment {vllm_deployment_id}")
+                
+                # Check if other requests are using this deployment
+                other_requests = await self._get_vllm_queue_collection().find({
+                    "vllm_deployment_id": vllm_deployment_id,
+                    "queue_request_id": {"$ne": queue_request_id},
+                    "status": {"$in": ["pending", "processing"]}
+                }).to_list(length=None)
+                
+                if not other_requests:
+                    # No other requests using this deployment, safe to delete
+                    try:
+                        # Call VLLM service to stop deployment
+                        import aiohttp
+                        from config import BENCHMARK_VLLM_URL
+                        
+                        async with aiohttp.ClientSession() as session:
+                            delete_url = f"{BENCHMARK_VLLM_URL}/deployments/{vllm_deployment_id}"
+                            async with session.delete(delete_url) as response:
+                                if response.status in [200, 204, 404]:
+                                    logger.info(f"Successfully deleted VLLM deployment {vllm_deployment_id}")
+                                else:
+                                    error_text = await response.text()
+                                    logger.warning(f"Failed to delete VLLM deployment: HTTP {response.status} - {error_text}")
+                    
+                    except Exception as e:
+                        logger.warning(f"Error deleting VLLM deployment {vllm_deployment_id}: {e}")
+                else:
+                    logger.info(f"VLLM deployment {vllm_deployment_id} is used by {len(other_requests)} other requests, not deleting")
+            else:
+                logger.info(f"No VLLM deployment to clean up for request {queue_request_id} (deployment_id: {vllm_deployment_id})")
+            
+            logger.info(f"Completed VLLM cleanup for request {queue_request_id}")
+            
+        except Exception as e:
+            logger.error(f"Error during VLLM deployment cleanup for request {queue_request_id}: {e}")
+
+    async def change_vllm_queue_priority(self, queue_request_id: str, new_priority: str) -> bool:
+        """Change priority of a VLLM queue request"""
+        try:
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            result = await queue_collection.update_one(
+                {"queue_request_id": queue_request_id, "status": "pending"},
+                {"$set": {"priority": new_priority}}
+            )
+            
+            if result.modified_count > 0:
+                logger.info(f"Changed priority of VLLM queue request {queue_request_id} to {new_priority}")
+                return True
+            else:
+                logger.warning(f"VLLM queue request {queue_request_id} not found or not pending")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to change priority for VLLM queue request {queue_request_id}: {e}")
+            return False
+
+    # -----------------------------------------------------------------------------
+    # VLLM Queue Helper Methods
+    # -----------------------------------------------------------------------------
+
+    async def _save_vllm_queue_request_to_db(self, queue_doc: Dict[str, Any]):
+        """Save VLLM queue request to database"""
+        try:
+            queue_collection = await self._get_vllm_queue_collection()
+            await queue_collection.insert_one(queue_doc)
+        except Exception as e:
+            logger.error(f"Failed to save VLLM queue request to database: {e}")
+            raise
+
+    async def _get_vllm_queue_collection(self):
+        """Get VLLM queue collection from database"""
+        from database import get_database
+        db = get_database()
+        return db.vllm_deployment_queue
+
+    # -----------------------------------------------------------------------------
+    # VLLM Queue Scheduler Methods
+    # -----------------------------------------------------------------------------
+
+    async def process_vllm_queue(self):
+        """Process pending VLLM queue requests"""
+        # 이미 큐 처리 중이면 건너뛰기 (동시 처리 방지)
+        if self.processing_queue:
+            logger.info("Queue processing already in progress, skipping...")
+            return
+            
+        try:
+            self.processing_queue = True
+            logger.info("Starting VLLM queue processing cycle...")
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            # 현재 처리 중인 요청이 있는지 확인
+            processing_request = await queue_collection.find_one({"status": "processing"})
+            if processing_request:
+                logger.info(f"Request {processing_request['queue_request_id']} is currently processing, waiting...")
+                return
+            
+            # Get pending requests sorted by priority and creation time
+            priority_order = {"urgent": 4, "high": 3, "medium": 2, "low": 1}
+            
+            pending_requests = []
+            total_requests = await queue_collection.count_documents({})
+            pending_count = await queue_collection.count_documents({"status": "pending"})
+            processing_count = await queue_collection.count_documents({"status": "processing"})
+            
+            logger.info(f"Queue status: Total={total_requests}, Pending={pending_count}, Processing={processing_count}")
+            
+            async for request in queue_collection.find({"status": "pending"}).sort("created_at", 1):
+                request["_priority_score"] = priority_order.get(request["priority"], 1)
+                pending_requests.append(request)
+                logger.info(f"Found pending request: {request['queue_request_id']} (priority: {request['priority']})")
+            
+            if not pending_requests:
+                logger.info("No pending requests in queue")
+                return
+            
+            # Sort by priority (high to low) then by creation time (old to new)
+            pending_requests.sort(key=lambda x: (-x["_priority_score"], x["created_at"]))
+            
+            # 한 번에 하나의 요청만 처리 (순차 처리 보장)
+            request = pending_requests[0]
+            logger.info(f"Processing queue request {request['queue_request_id']} (priority: {request['priority']})")
+            
+            try:
+                await self._process_single_vllm_request(request)
+            except Exception as e:
+                logger.error(f"Failed to process VLLM queue request {request['queue_request_id']}: {e}")
+                await self._mark_request_failed(request["queue_request_id"], str(e))
+                    
+        except Exception as e:
+            logger.error(f"Failed to process VLLM queue: {e}")
+        finally:
+            self.processing_queue = False
+
+    async def _process_single_vllm_request(self, request):
+        """Process a single VLLM queue request"""
+        queue_request_id = request["queue_request_id"]
+        skip_vllm_creation = request.get("skip_vllm_creation", False)
+        
+        try:
+            # Mark as processing immediately when starting
+            await self._update_request_status(queue_request_id, "processing", 
+                                            "benchmark_jobs" if skip_vllm_creation else "vllm_deployment")
+            
+            # Step 1: Deploy VLLM (건너뛰기 옵션이 활성화되지 않은 경우에만)
+            if skip_vllm_creation:
+                logger.info(f"Skipping VLLM creation for request {queue_request_id} - using existing VLLM")
+                # 기존 VLLM 작업을 완전히 건너뛰고 플레이스홀더만 설정
+                vllm_deployment_info = {"deployment_id": "existing-vllm"}
+                logger.info(f"VLLM creation skipped, proceeding with benchmark jobs only")
+            else:
+                # VLLM 배포 시작 시 상태를 즉시 processing으로 변경
+                await self._update_request_status(queue_request_id, "processing", "vllm_deployment")
+                
+                # Check if vllm_config is valid before deploying
+                if not request["vllm_config"] or not request["vllm_config"].get("model_name"):
+                    raise Exception("Invalid or empty VLLM configuration")
+                
+                vllm_deployment_info = await self._deploy_vllm_from_config(request["vllm_config"])
+                # Update with VLLM deployment ID
+                await self._update_request_with_vllm_deployment(queue_request_id, vllm_deployment_info["deployment_id"])
+                # VLLM 배포 완료 시 스텝 증가
+                await self._increment_completed_steps(queue_request_id)
+            
+            # Step 2: Process benchmark jobs
+            benchmark_job_ids = []
+            benchmark_configs = request.get("benchmark_configs", [])
+            
+            if benchmark_configs:
+                for i, benchmark_config in enumerate(benchmark_configs):
+                    try:
+                        await self._update_request_status(
+                            queue_request_id, 
+                            "processing", 
+                            f"benchmark_job_{i+1}_deploying"
+                        )
+                        
+                        # Deploy benchmark job
+                        job_deployment_id = await self._deploy_benchmark_job(
+                            benchmark_config, 
+                            vllm_deployment_info
+                        )
+                        benchmark_job_ids.append(job_deployment_id)
+                        
+                        # Update status to running
+                        await self._update_request_status(
+                            queue_request_id, 
+                            "processing", 
+                            f"benchmark_job_{i+1}_running"
+                        )
+                        
+                        # Wait for the job to complete before proceeding to next one
+                        await self._wait_for_deployed_job_completion(
+                            job_deployment_id=job_deployment_id,
+                            namespace=benchmark_config.get("namespace", "default"),
+                            timeout=3600  # 1 hour timeout per job
+                        )
+                        
+                        # Update progress
+                        await self._increment_completed_steps(queue_request_id)
+                        logger.info(f"Completed benchmark job {i+1}/{len(benchmark_configs)} for request {queue_request_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to deploy benchmark job {i+1} for request {queue_request_id}: {e}")
+                        # Continue with other jobs even if one fails
+            else:
+                logger.info(f"No benchmark jobs to process for request {queue_request_id}")
+            
+            # Mark as completed only after all steps are done
+            await self._mark_request_completed(queue_request_id, benchmark_job_ids)
+            logger.info(f"Request {queue_request_id} completed successfully with {len(benchmark_job_ids)} benchmark jobs")
+            
+        except Exception as e:
+            await self._mark_request_failed(queue_request_id, str(e))
+            raise
+
+
+
+    async def _deploy_vllm_from_config(self, vllm_config):
+        """Deploy VLLM using Helm configuration"""
+        from models import VLLMHelmDeploymentRequest, VLLMHelmConfig, VLLMConfig
+        
+        # Convert dict to VLLMConfig object
+        config = VLLMConfig(**vllm_config)
+        
+        # Create clean model name for consistent naming (no timestamp)
+        clean_model_name = config.model_name.replace('/', '-').replace('_', '-').lower()
+        release_name = f"vllm-{clean_model_name}"
+        
+        # Create Helm deployment request with fixed Pod naming
+        helm_config = VLLMHelmConfig(
+            release_name=release_name,
+            chart_path="./benchmark-vllm-helm/charts/thaki/vllm",
+            namespace=config.namespace,
+            project_id=None,  # No custom values file for queue deployments
+            values_file_id=None,
+            additional_args=f"--set vllm.model={config.model_name} --set fullnameOverride=vllm-{clean_model_name} --set resources.limits.{config.gpu_resource_type}={config.gpu_resource_count} --set resources.requests.{config.gpu_resource_type}={config.gpu_resource_count}"
+        )
+        
+        helm_request = VLLMHelmDeploymentRequest(
+            vllm_config=config,
+            vllm_helm_config=helm_config
+        )
+        
+        # Deploy using Helm
+        result = await self.deploy_vllm_with_helm(helm_request)
+        
+        # Return the actual release name for proper service name mapping
+        return {
+            "deployment_id": result["deployment_id"],
+            "release_name": release_name,
+            "service_name": f"{release_name}-service",
+            "namespace": config.namespace
+        }
+
+    async def _deploy_benchmark_job(self, benchmark_config, vllm_deployment_info):
+        """Deploy a benchmark job"""
+        from models import DeploymentRequest
+        
+        # Replace placeholders in YAML
+        yaml_content = benchmark_config["yaml_content"]
+        
+        # 기존 VLLM 사용 시 플레이스홀더를 그대로 유지 (사용자가 YAML에서 직접 처리)
+        if vllm_deployment_info["deployment_id"] == "existing-vllm":
+            logger.info("Using existing VLLM - placeholders in YAML will remain unchanged for user to configure")
+            # 플레이스홀더를 그대로 두어 사용자가 직접 실제 서비스 이름으로 교체하도록 함
+        else:
+            # 새로 배포된 VLLM의 경우 실제 Helm 릴리스 정보를 사용
+            service_name = vllm_deployment_info.get("service_name", f"vllm-service-{vllm_deployment_info['deployment_id'][:8]}")
+            release_name = vllm_deployment_info.get("release_name", f"vllm-{vllm_deployment_info['deployment_id'][:8]}")
+            
+            logger.info(f"Replacing placeholders: VLLM_SERVICE_NAME -> {service_name}, VLLM_DEPLOYMENT_NAME -> {release_name}")
+            
+            yaml_content = yaml_content.replace("VLLM_DEPLOYMENT_NAME", release_name)
+            yaml_content = yaml_content.replace("VLLM_SERVICE_NAME", service_name)
+        
+        # Create deployment request
+        deployment_request = DeploymentRequest(
+            yaml_content=yaml_content,
+            namespace=benchmark_config.get("namespace", "default")
+        )
+        
+        # Deploy the job
+        deployment_response = await self.deploy_yaml(deployment_request)
+        
+        job_name = benchmark_config.get("name", "benchmark-job")
+        logger.info(f"Successfully deployed benchmark job '{job_name}': {deployment_response.resource_name}")
+        return deployment_response.deployment_id
+
+    # Queue status update methods
+    async def _update_request_status(self, queue_request_id, status, current_step=None):
+        update_data = {
+            "status": status,
+            "started_at": datetime.now() if status == "processing" else None
+        }
+        if current_step:
+            update_data["current_step"] = current_step
+            
+        queue_collection = await self._get_vllm_queue_collection()
+        await queue_collection.update_one(
+            {"queue_request_id": queue_request_id},
+            {"$set": update_data}
+        )
+
+    async def _update_request_with_vllm_deployment(self, queue_request_id, vllm_deployment_id):
+        queue_collection = await self._get_vllm_queue_collection()
+        await queue_collection.update_one(
+            {"queue_request_id": queue_request_id},
+            {"$set": {"vllm_deployment_id": vllm_deployment_id}}
+        )
+
+    async def _increment_completed_steps(self, queue_request_id):
+        queue_collection = await self._get_vllm_queue_collection()
+        await queue_collection.update_one(
+            {"queue_request_id": queue_request_id},
+            {"$inc": {"completed_steps": 1}}
+        )
+
+    async def _mark_request_completed(self, queue_request_id, benchmark_job_ids):
+        queue_collection = await self._get_vllm_queue_collection()
+        await queue_collection.update_one(
+            {"queue_request_id": queue_request_id},
+            {"$set": {
+                "status": "completed",
+                "completed_at": datetime.now(),
+                "benchmark_job_ids": benchmark_job_ids,
+                "current_step": "completed"
+            }}
+        )
+
+    async def _mark_request_failed(self, queue_request_id, error_message):
+        queue_collection = await self._get_vllm_queue_collection()
+        await queue_collection.update_one(
+            {"queue_request_id": queue_request_id},
+            {"$set": {
+                "status": "failed",
+                "completed_at": datetime.now(),
+                "error_message": error_message,
+                "current_step": "failed"
+            }}
+        )
+        logger.info(f"Marked queue request {queue_request_id} as failed: {error_message}")
+
+    async def deploy_vllm_with_helm(self, request: VLLMHelmDeploymentRequest) -> Dict[str, Any]:
+        try:
+            import aiohttp
+            import tempfile
+            import os
+            import subprocess
+            import asyncio
+            
+            # Check if VLLM creation should be skipped
+            skip_vllm_creation = getattr(request, 'skip_vllm_creation', False)
+            
+            if skip_vllm_creation:
+                logger.info(f"VLLM creation is skipped - redirecting to queue deployment for benchmark jobs only")
+                
+                # Convert to queue request and process via queue
+                from models import VLLMDeploymentQueueRequest
+                queue_request = VLLMDeploymentQueueRequest(
+                    vllm_config=None,  # No config when skipping VLLM creation
+                    benchmark_configs=request.benchmark_configs or [],
+                    scheduling_config=request.scheduling_config or {},
+                    priority=request.priority,
+                    skip_vllm_creation=True
+                )
+                
+                # Add to queue instead of deploying
+                queue_response = await self.add_vllm_to_queue(queue_request)
+                
+                return {
+                    "status": "success",
+                    "message": f"Benchmark jobs added to queue (VLLM creation skipped)",
+                    "deployment_id": "skipped-vllm",
+                    "queue_request_id": queue_response.queue_request_id,
+                    "action": "queued"
+                }
+            
+            logger.info(f"Starting VLLM Helm deployment: {request.vllm_helm_config.release_name}")
+            
+            # First, register this Helm deployment request in the benchmark-vllm queue
+            queue_request_id = await self._register_helm_deployment_in_queue(request)
+            
+            # Get custom values file content if specified
+            values_content = None
+            if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
+                logger.info(f"Fetching custom values file: {request.vllm_helm_config.values_file_id}")
+                
+                # Call benchmark-manager API to get file content
+                from config import BENCHMARK_MANAGER_URL
+                async with aiohttp.ClientSession() as session:
+                    file_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}/files/{request.vllm_helm_config.values_file_id}"
+                    async with session.get(file_url) as response:
+                        if response.status == 200:
+                            file_data = await response.json()
+                            values_content = file_data.get('file', {}).get('content', '')
+                            logger.info(f"Retrieved custom values file content: {len(values_content)} characters")
+                        else:
+                            logger.warning(f"Failed to fetch custom values file: {response.status}")
+            
+            # Create temporary values file
+            values_file_path = None
+            if values_content:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                    f.write(values_content)
+                    values_file_path = f.name
+                    logger.info(f"Created temporary values file: {values_file_path}")
+            
+            try:
+                # Resolve chart path - the chart_path from request might be incorrect
+                # For VLLM deployments, we need to use a standard chart location
+                requested_chart_path = request.vllm_helm_config.chart_path
+                logger.info(f"Requested chart path: {requested_chart_path}")
+                
+                # For VLLM Helm deployments, use a remote chart or local chart
+                # Try to find the correct chart path
+                possible_chart_paths = [
+                    # Try the requested path first
+                    requested_chart_path,
+                    # Try common local locations
+                    "./charts/vllm",
+                    "../benchmark-vllm-helm/charts/thaki/vllm", 
+                    # Try absolute paths that might be mounted in containers
+                    "/charts/vllm",
+                    "/thaki/vllm",
+                    # Try relative paths
+                    "./vllm",
+                    "../vllm"
+                ]
+                
+                chart_path = None
+                for possible_path in possible_chart_paths:
+                    if os.path.exists(possible_path) and os.path.exists(os.path.join(possible_path, "Chart.yaml")):
+                        chart_path = possible_path
+                        logger.info(f"Found valid chart at: {chart_path}")
+                        break
+                
+                # If no local chart found, try to use a remote chart
+                if not chart_path:
+                    logger.warning(f"No local chart found. Attempting to use remote chart...")
+                    # You could add logic here to clone a remote chart repository
+                    # For now, let's try a common Helm repository
+                    chart_path = "vllm/vllm"  # This would be a chart from a Helm repository
+                    logger.info(f"Using remote chart: {chart_path}")
+                
+                logger.info(f"Final chart path: {chart_path}")
+                
+                # Check if release already exists and compare configurations
+                should_upgrade = await self._should_upgrade_helm_release(request)
+                
+                if should_upgrade == "upgrade":
+                    # Use uninstall/install instead of upgrade to avoid CRD issues
+                    await self._uninstall_helm_release(request.vllm_helm_config.release_name, request.vllm_helm_config.namespace)
+                    helm_cmd = [
+                        "helm", "install", request.vllm_helm_config.release_name,
+                        chart_path,
+                        "--namespace", request.vllm_helm_config.namespace,
+                        "--create-namespace"
+                    ]
+                    logger.info(f"Uninstalling and reinstalling Helm release: {request.vllm_helm_config.release_name}")
+                elif should_upgrade == "reinstall":
+                    # Uninstall existing release and install new one
+                    await self._uninstall_helm_release(request.vllm_helm_config.release_name, request.vllm_helm_config.namespace)
+                    helm_cmd = [
+                        "helm", "install", request.vllm_helm_config.release_name,
+                        chart_path,
+                        "--namespace", request.vllm_helm_config.namespace,
+                        "--create-namespace"
+                    ]
+                    logger.info(f"Reinstalling Helm release: {request.vllm_helm_config.release_name}")
+                elif should_upgrade == "skip":
+                    # Same configuration, skip deployment
+                    logger.info(f"Skipping deployment - same configuration already exists: {request.vllm_helm_config.release_name}")
+                    
+                    # Update queue status to completed with skip action
+                    if queue_request_id:
+                        await self._update_queue_status(queue_request_id, "skipped", "skipped-same-config")
+                    
+                    return {
+                        "status": "success",
+                        "message": f"VLLM Helm deployment skipped - same configuration already exists: {request.vllm_helm_config.release_name}",
+                        "deployment_id": "skipped",
+                        "release_name": request.vllm_helm_config.release_name,
+                        "namespace": request.vllm_helm_config.namespace,
+                        "action": "skipped"
+                    }
+                else:
+                    # New installation
+                    helm_cmd = [
+                        "helm", "install", request.vllm_helm_config.release_name,
+                        chart_path,
+                        "--namespace", request.vllm_helm_config.namespace,
+                        "--create-namespace"
+                    ]
+                    logger.info(f"Installing new Helm release: {request.vllm_helm_config.release_name}")
+                
+                # Add custom values file if available
+                if values_file_path:
+                    helm_cmd.extend(["-f", values_file_path])
+                
+                # Add additional arguments if specified
+                if request.vllm_helm_config.additional_args:
+                    additional_args = request.vllm_helm_config.additional_args.split()
+                    helm_cmd.extend(additional_args)
+                
+                logger.info(f"Executing Helm command: {' '.join(helm_cmd)}")
+                
+                # Execute Helm install
+                result = await asyncio.create_subprocess_exec(
+                    *helm_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                stdout, stderr = await result.communicate()
+                
+                if result.returncode == 0:
+                    logger.info(f"Helm deployment successful: {request.vllm_helm_config.release_name}")
+                    
+                    # Store deployment info in database
+                    deployment_id = str(uuid.uuid4())
+                    deployment_doc = {
+                        "deployment_id": deployment_id,
+                        "resource_name": request.vllm_helm_config.release_name,
+                        "resource_type": "helm_release",
+                        "namespace": request.vllm_helm_config.namespace,
+                        "helm_config": request.vllm_helm_config.dict(),
+                        "vllm_config": request.vllm_config,
+                        "created_at": datetime.now(),
+                        "status": "deployed",
+                        "helm_output": stdout.decode()
+                    }
+                    
+                    deployments_collection = get_deployments_collection()
+                    await deployments_collection.insert_one(deployment_doc)
+                    
+                    # Always wait for VLLM to be ready, even without benchmark jobs
+                    logger.info("Waiting for VLLM service to be ready...")
+                    try:
+                        await self._wait_for_vllm_ready(
+                            release_name=request.vllm_helm_config.release_name,
+                            namespace=request.vllm_helm_config.namespace,
+                            timeout=600  # 10 minutes timeout
+                        )
+                        logger.info("VLLM service is ready")
+                        
+                        # Execute benchmark jobs if any
+                        if request.benchmark_configs:
+                            logger.info("Executing benchmark jobs...")
+                            await self._execute_helm_benchmark_jobs(request.benchmark_configs, deployment_id)
+                            logger.info("All benchmark jobs completed successfully")
+                        
+                        # Update queue status to completed only after everything succeeds
+                        if queue_request_id:
+                            await self._update_queue_status(queue_request_id, "completed", deployment_id)
+                            
+                    except Exception as e:
+                        logger.error(f"VLLM readiness check or benchmark jobs failed: {e}")
+                        # Update queue status to failed
+                        if queue_request_id:
+                            await self._update_queue_status(queue_request_id, "failed", deployment_id, f"VLLM readiness or benchmark jobs failed: {str(e)}")
+                        
+                        # Clean up failed deployment
+                        try:
+                            await self._uninstall_helm_release(request.vllm_helm_config.release_name, request.vllm_helm_config.namespace)
+                            logger.info(f"Cleaned up failed deployment: {request.vllm_helm_config.release_name}")
+                        except Exception as cleanup_error:
+                            logger.warning(f"Failed to clean up deployment: {cleanup_error}")
+                        
+                        raise Exception(f"VLLM deployment failed: {str(e)}")
+                    
+                    return {
+                        "status": "success",
+                        "message": f"VLLM Helm deployment successful: {request.vllm_helm_config.release_name}",
+                        "deployment_id": deployment_id,
+                        "release_name": request.vllm_helm_config.release_name,
+                        "namespace": request.vllm_helm_config.namespace,
+                        "helm_output": stdout.decode(),
+                        "action": should_upgrade
+                    }
+                else:
+                    error_msg = stderr.decode()
+                    logger.error(f"Helm deployment failed: {error_msg}")
+                    
+                    # Update queue status to failed
+                    if queue_request_id:
+                        await self._update_queue_status(queue_request_id, "failed", None, error_msg)
+                    
+                    raise Exception(f"Helm deployment failed: {error_msg}")
+                    
+            finally:
+                # Clean up temporary values file
+                if values_file_path and os.path.exists(values_file_path):
+                    os.unlink(values_file_path)
+                    logger.info(f"Cleaned up temporary values file: {values_file_path}")
+                    
+        except Exception as e:
+            logger.error(f"VLLM Helm deployment failed: {e}")
+            raise Exception(f"VLLM Helm deployment failed: {str(e)}")
+
+    async def _register_helm_deployment_in_queue(self, request: VLLMHelmDeploymentRequest):
+        """Register Helm deployment request in the benchmark-vllm queue for visibility"""
+        try:
+            import aiohttp
+            from config import BENCHMARK_VLLM_URL
+            
+            logger.info("Registering Helm deployment in benchmark-vllm queue...")
+            
+            # Prepare queue request data compatible with benchmark-vllm QueueRequest model
+            queue_request_data = {
+                "vllm_config": request.vllm_config,
+                "benchmark_configs": request.benchmark_configs or [],
+                "scheduling_config": request.scheduling_config or {
+                    "immediate": True,
+                    "scheduled_time": None,
+                    "max_wait_time": 3600
+                },
+                "priority": request.priority,
+                "vllm_yaml_content": None,
+                # Add Helm-specific metadata
+                "helm_deployment": True,
+                "helm_config": request.vllm_helm_config.dict()
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                queue_url = f"{BENCHMARK_VLLM_URL}/queue/deployment"
+                async with session.post(queue_url, json=queue_request_data) as response:
+                    if response.status == 200:
+                        queue_response = await response.json()
+                        logger.info(f"Successfully registered Helm deployment in queue: {queue_response.get('queue_request_id')}")
+                        return queue_response.get('queue_request_id')
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"Failed to register Helm deployment in queue: {response.status} - {error_text}")
+                        return None
+                        
+        except Exception as e:
+            logger.warning(f"Failed to register Helm deployment in queue: {e}")
+            # Don't fail the deployment if queue registration fails
+            return None
+
+    async def _should_upgrade_helm_release(self, request: VLLMHelmDeploymentRequest) -> str:
+        """
+        Check if Helm release exists and determine action needed
+        Returns: 'install', 'upgrade', 'reinstall', or 'skip'
+        """
+        try:
+            import subprocess
+            import json
+            import asyncio
+            
+            release_name = request.vllm_helm_config.release_name
+            namespace = request.vllm_helm_config.namespace
+            
+            logger.info(f"Checking existing Helm release: {release_name} in namespace: {namespace}")
+            
+            # Check if release exists
+            check_cmd = ["helm", "list", "-n", namespace, "-o", "json"]
+            result = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode != 0:
+                logger.info(f"No existing releases found in namespace {namespace}")
+                return "install"
+            
+            try:
+                releases = json.loads(stdout.decode())
+                existing_release = None
+                
+                for release in releases:
+                    if release.get("name") == release_name:
+                        existing_release = release
+                        break
+                
+                if not existing_release:
+                    logger.info(f"Release {release_name} not found, proceeding with install")
+                    return "install"
+                
+                logger.info(f"Found existing release: {existing_release}")
+                
+                # Get current release values
+                get_values_cmd = ["helm", "get", "values", release_name, "-n", namespace, "-o", "json"]
+                values_result = await asyncio.create_subprocess_exec(
+                    *get_values_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                values_stdout, values_stderr = await values_result.communicate()
+                
+                if values_result.returncode == 0:
+                    try:
+                        current_values = json.loads(values_stdout.decode())
+                        logger.info(f"Current release values: {current_values}")
+                        
+                        # Compare configurations
+                        if await self._compare_helm_configurations(current_values, request):
+                            logger.info("Configurations are identical, skipping deployment")
+                            return "skip"
+                        else:
+                            logger.info("Configurations differ, upgrade needed")
+                            return "upgrade"
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse current values, proceeding with upgrade")
+                        return "upgrade"
+                else:
+                    logger.warning(f"Failed to get current values: {values_stderr.decode()}")
+                    return "upgrade"
+                    
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse helm list output")
+                return "install"
+                
+        except Exception as e:
+            logger.error(f"Error checking Helm release: {e}")
+            return "install"
+
+    async def _compare_helm_configurations(self, current_values: dict, new_request: VLLMHelmDeploymentRequest) -> bool:
+        """
+        Compare current Helm values with new request configuration
+        Returns True if configurations are identical, False otherwise
+        """
+        try:
+            logger.info(f"=== Configuration Comparison Debug ===")
+            logger.info(f"Raw current_values: {current_values}")
+            logger.info(f"Raw new_request.vllm_config: {new_request.vllm_config}")
+            
+            # Handle null or empty current values (common when no custom values were provided)
+            if current_values is None or current_values == {}:
+                logger.info("Current Helm values are null/empty - using default comparison strategy")
+                # If no custom values were provided, we should check the actual deployed resources
+                # For now, we'll assume it's a different configuration to trigger reinstall
+                # In a production environment, you might want to get the actual running pod configuration
+                logger.info("=== No custom values found - assuming different configuration ===")
+                return False
+            
+            # Handle both dict and VLLMConfig object for new_request.vllm_config
+            if hasattr(new_request.vllm_config, 'dict'):
+                new_vllm_config = new_request.vllm_config.dict()
+            elif isinstance(new_request.vllm_config, dict):
+                new_vllm_config = new_request.vllm_config
+            else:
+                logger.warning(f"Unexpected vllm_config type: {type(new_request.vllm_config)}")
+                return False
+            
+            # Extract key configuration values for comparison with flexible structure mapping
+            # Try multiple possible paths for current values to handle different Helm chart structures
+            def safe_get_nested(data, *paths):
+                """Try multiple nested paths and return the first found value"""
+                for path in paths:
+                    current = data
+                    try:
+                        for key in path:
+                            current = current[key]
+                        return current
+                    except (KeyError, TypeError):
+                        continue
+                return None
+            
+            current_config = {
+                "model_name": safe_get_nested(current_values, 
+                    ["model", "name"], 
+                    ["model_name"], 
+                    ["vllm", "model", "name"],
+                    ["vllm", "vllm", "model"],  # Handle nested vllm.vllm structure
+                    ["config", "model_name"]
+                ) or "",
+                "gpu_memory_utilization": safe_get_nested(current_values,
+                    ["resources", "gpu_memory_utilization"],
+                    ["gpu_memory_utilization"],
+                    ["vllm", "gpu_memory_utilization"],
+                    ["vllm", "vllm", "gpuMemoryUtilization"],  # Handle camelCase
+                    ["config", "gpu_memory_utilization"]
+                ) or 0.0,
+                "max_num_seqs": safe_get_nested(current_values,
+                    ["config", "max_num_seqs"],
+                    ["max_num_seqs"],
+                    ["vllm", "config", "max_num_seqs"],
+                    ["vllm", "vllm", "maxModelLen"],  # Sometimes mapped differently
+                    ["vllm", "max_num_seqs"]
+                ) or 2,
+                "tensor_parallel_size": safe_get_nested(current_values,
+                    ["config", "tensor_parallel_size"],
+                    ["tensor_parallel_size"],
+                    ["vllm", "config", "tensor_parallel_size"],
+                    ["vllm", "vllm", "tensor_parallel_size"],
+                    ["vllm", "tensor_parallel_size"]
+                ) or 1,
+                "port": safe_get_nested(current_values,
+                    ["service", "port"],
+                    ["port"],
+                    ["vllm", "service", "port"],
+                    ["vllm", "vllm", "port"],
+                    ["vllm", "port"]
+                ) or 8000,
+                "gpu_resource_type": safe_get_nested(current_values,
+                    ["resources", "gpu_resource_type"],
+                    ["gpu_resource_type"],
+                    ["vllm", "resources", "gpu_resource_type"],
+                    ["vllm", "vllm", "gpu_resource_type"],
+                    ["vllm", "gpu_resource_type"]
+                ) or "cpu",
+                "gpu_resource_count": safe_get_nested(current_values,
+                    ["resources", "gpu_resource_count"],
+                    ["gpu_resource_count"],
+                    ["vllm", "resources", "gpu_resource_count"],
+                    ["vllm", "vllm", "gpu_resource_count"],
+                    ["vllm", "gpu_resource_count"]
+                ) or 0
+            }
+            
+            new_config = {
+                "model_name": new_vllm_config.get("model_name", ""),
+                "gpu_memory_utilization": new_vllm_config.get("gpu_memory_utilization", 0.0),
+                "max_num_seqs": new_vllm_config.get("max_num_seqs", 2),
+                "tensor_parallel_size": new_vllm_config.get("tensor_parallel_size", 1),
+                "port": new_vllm_config.get("port", 8000),
+                "gpu_resource_type": new_vllm_config.get("gpu_resource_type", "cpu"),
+                "gpu_resource_count": new_vllm_config.get("gpu_resource_count", 0)
+            }
+            
+            logger.info(f"=== Extracted Configurations ===")
+            logger.info(f"Current: {current_config}")
+            logger.info(f"New: {new_config}")
+            
+            # Special handling for empty/default configurations
+            # If current config is all empty/default values, compare with actual pod environment
+            current_is_empty = all(
+                not value or value in [0, 0.0, "", "cpu", 1, 2, 8000] 
+                for value in current_config.values()
+            )
+            
+            if current_is_empty:
+                logger.info("Current configuration appears to be empty/default - checking pod environment")
+                # Try to get actual running configuration from pod environment
+                actual_config = await self._get_actual_pod_configuration(new_request.vllm_helm_config.release_name, new_request.vllm_helm_config.namespace)
+                if actual_config:
+                    current_config = actual_config
+                    logger.info(f"Updated current config from pod: {current_config}")
+            
+            # Compare each field and log differences
+            is_identical = True
+            differences = []
+            
+            for key in current_config.keys():
+                current_val = current_config[key]
+                new_val = new_config[key]
+                
+                # Handle different types (float vs int, string comparison)
+                if isinstance(current_val, (int, float)) and isinstance(new_val, (int, float)):
+                    if abs(float(current_val) - float(new_val)) > 0.001:  # Small tolerance for float comparison
+                        differences.append(f"{key}: {current_val} != {new_val}")
+                        is_identical = False
+                elif str(current_val).strip() != str(new_val).strip():
+                    differences.append(f"{key}: '{current_val}' != '{new_val}'")
+                    is_identical = False
+            
+            if differences:
+                logger.info(f"=== Configuration Differences Found ===")
+                for diff in differences:
+                    logger.info(f"  - {diff}")
+                logger.info("=== Upgrade Required ===")
+            else:
+                logger.info("=== Configurations are Identical - Skipping Deployment ===")
+            
+            return is_identical
+            
+        except Exception as e:
+            logger.error(f"Error comparing configurations: {e}")
+            logger.error(f"Exception details: {type(e).__name__}: {str(e)}")
+            return False
+
+    async def _get_actual_pod_configuration(self, release_name: str, namespace: str) -> dict:
+        """Get actual configuration from running pod environment variables and command args"""
+        try:
+            import subprocess
+            import json
+            import re
+            
+            # Get pods for the release
+            cmd = [
+                "kubectl", "get", "pods", 
+                "-l", f"app.kubernetes.io/instance={release_name}",
+                "-n", namespace,
+                "-o", "json"
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                pods_data = json.loads(result.stdout)
+                pods = pods_data.get("items", [])
+                
+                if pods:
+                    pod = pods[0]  # Take the first pod
+                    containers = pod.get("spec", {}).get("containers", [])
+                    
+                    if containers:
+                        container = containers[0]  # Take the first container
+                        
+                        # Get environment variables
+                        env_vars = container.get("env", [])
+                        env_dict = {env.get("name"): env.get("value") for env in env_vars if env.get("name") and env.get("value")}
+                        
+                        # Get command arguments (more reliable for VLLM configuration)
+                        args = container.get("args", [])
+                        
+                        # Parse VLLM command line arguments
+                        config = {
+                            "model_name": "",
+                            "gpu_memory_utilization": 0.0,
+                            "max_num_seqs": 2,
+                            "tensor_parallel_size": 1,
+                            "port": 8000,
+                            "gpu_resource_type": "cpu",
+                            "gpu_resource_count": 0
+                        }
+                        
+                        # Parse command line arguments
+                        for arg in args:
+                            if arg.startswith("--model="):
+                                config["model_name"] = arg.split("=", 1)[1] if "=" in arg else ""
+                            elif arg.startswith("--gpu-memory-utilization="):
+                                try:
+                                    config["gpu_memory_utilization"] = float(arg.split("=", 1)[1])
+                                except ValueError:
+                                    pass
+                            elif arg.startswith("--max-num-seqs="):
+                                try:
+                                    config["max_num_seqs"] = int(arg.split("=", 1)[1])
+                                except ValueError:
+                                    pass
+                            elif arg.startswith("--tensor-parallel-size="):
+                                try:
+                                    config["tensor_parallel_size"] = int(arg.split("=", 1)[1])
+                                except ValueError:
+                                    pass
+                            elif arg.startswith("--port="):
+                                try:
+                                    config["port"] = int(arg.split("=", 1)[1])
+                                except ValueError:
+                                    pass
+                        
+                        # Check environment variables for device type
+                        if env_dict.get("VLLM_DEVICE") == "cpu" or env_dict.get("VLLM_USE_CPU") == "1":
+                            config["gpu_resource_type"] = "cpu"
+                            config["gpu_resource_count"] = 0
+                        elif env_dict.get("CUDA_VISIBLE_DEVICES"):
+                            config["gpu_resource_type"] = "gpu"
+                            # Count GPUs from CUDA_VISIBLE_DEVICES
+                            cuda_devices = env_dict.get("CUDA_VISIBLE_DEVICES", "")
+                            if cuda_devices and cuda_devices != "":
+                                config["gpu_resource_count"] = len(cuda_devices.split(","))
+                            else:
+                                config["gpu_resource_count"] = 0
+                        
+                        # Override with environment variables if available
+                        if env_dict.get("VLLM_PORT"):
+                            try:
+                                config["port"] = int(env_dict["VLLM_PORT"])
+                            except ValueError:
+                                pass
+                        
+                        logger.info(f"Extracted actual pod configuration from args: {args}")
+                        logger.info(f"Extracted actual pod configuration from env: {env_dict}")
+                        logger.info(f"Final actual pod configuration: {config}")
+                        return config
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to get actual pod configuration: {e}")
+            return None
+
+    async def _uninstall_helm_release(self, release_name: str, namespace: str):
+        """Uninstall existing Helm release"""
+        try:
+            import subprocess
+            import asyncio
+            
+            logger.info(f"Uninstalling Helm release: {release_name} from namespace: {namespace}")
+            
+            uninstall_cmd = ["helm", "uninstall", release_name, "-n", namespace]
+            result = await asyncio.create_subprocess_exec(
+                *uninstall_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode == 0:
+                logger.info(f"Successfully uninstalled Helm release: {release_name}")
+                logger.info(f"Uninstall output: {stdout.decode()}")
+                # Wait longer for resources to be completely cleaned up, especially CRDs
+                logger.info("Waiting for resources to be completely cleaned up...")
+                await asyncio.sleep(15)
+                
+                # Additional check to ensure pods are terminated
+                try:
+                    check_pods_cmd = ["kubectl", "get", "pods", "-n", namespace, "-l", f"app.kubernetes.io/instance={release_name}", "--no-headers"]
+                    pods_result = await asyncio.create_subprocess_exec(
+                        *check_pods_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    pods_stdout, _ = await pods_result.communicate()
+                    
+                    if pods_stdout.decode().strip():
+                        logger.info("Waiting for pods to be completely terminated...")
+                        await asyncio.sleep(10)
+                except Exception as e:
+                    logger.warning(f"Could not check pod status: {e}")
+                    
+            else:
+                logger.warning(f"Failed to uninstall Helm release: {stderr.decode()}")
+                # Continue anyway, maybe it was already uninstalled
+                
+        except Exception as e:
+            logger.error(f"Error uninstalling Helm release: {e}")
+            # Don't fail the deployment, continue with install
+
+    async def _update_queue_status(self, queue_request_id: str, status: str, deployment_id: str = None, error_message: str = None):
+        """Update queue status in benchmark-vllm service"""
+        try:
+            import aiohttp
+            from config import BENCHMARK_VLLM_URL
+            
+            logger.info(f"Updating queue status for {queue_request_id}: {status}")
+            
+            # Prepare update data
+            update_data = {
+                "status": status,
+                "completed_at": datetime.now().isoformat()
+            }
+            
+            if deployment_id:
+                update_data["deployment_id"] = deployment_id
+                
+            if error_message:
+                update_data["error_message"] = error_message
+            
+            async with aiohttp.ClientSession() as session:
+                update_url = f"{BENCHMARK_VLLM_URL}/queue/{queue_request_id}/status"
+                async with session.patch(update_url, json=update_data) as response:
+                    if response.status == 200:
+                        logger.info(f"Successfully updated queue status for {queue_request_id}")
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"Failed to update queue status: {response.status} - {error_text}")
+                        
+        except Exception as e:
+            logger.warning(f"Failed to update queue status for {queue_request_id}: {e}")
+            # Don't fail the deployment if queue update fails
+
+    async def _execute_helm_benchmark_jobs(self, benchmark_configs: List[Dict[str, Any]], deployment_id: str):
+        """Execute benchmark jobs for Helm deployment"""
+        logger.info(f"Executing {len(benchmark_configs)} benchmark jobs for Helm deployment {deployment_id}")
+        
+        for i, config in enumerate(benchmark_configs):
+            job_name = config.get('name', f'helm-benchmark-job-{i+1}')
+            yaml_content = config.get('yaml_content', '')
+            namespace = config.get('namespace', 'default')
+            
+            logger.info(f"Executing benchmark job {i+1}/{len(benchmark_configs)}: {job_name}")
+            
+            try:
+                # Create deployment request using the same logic as _deploy_benchmark_job
+                from models import DeploymentRequest
+                
+                deployment_request = DeploymentRequest(
+                    yaml_content=yaml_content,
+                    namespace=namespace
+                )
+                
+                # Deploy the benchmark job using existing deployment logic
+                deployment_result = await self.deploy_yaml(deployment_request)
+                
+                # Wait for the job to complete
+                actual_job_name = deployment_result.resource_name
+                await self._wait_for_benchmark_job_completion(
+                    job_name=actual_job_name,
+                    namespace=namespace,
+                    timeout=JOB_TIMEOUT,
+                    max_failures=JOB_MAX_FAILURES
+                )
+                
+                logger.info(f"Benchmark job {actual_job_name} completed successfully")
+                
+            except Exception as e:
+                logger.error(f"Failed to execute benchmark job {job_name}: {e}")
+                # Continue with next job even if current one fails
+                continue
+        
+        logger.info(f"Completed execution of {len(benchmark_configs)} benchmark jobs")
+
+    async def _wait_for_benchmark_job_completion(self, job_name: str, namespace: str, timeout: int = 3600, max_failures: int = 3):
+        """Wait for a benchmark job to complete with failure tracking"""
+        import asyncio
+        from datetime import datetime
+        
+        start_time = datetime.now()
+        failure_count = 0
+        consecutive_failures = 0
+        last_status = None
+        
+        while True:
+            try:
+                # Get job status
+                status_data = await self.get_job_status(job_name, namespace)
+                job_status = status_data.get('status', '').lower()
+                
+                logger.debug(f"Job {job_name} status: {job_status}")
+                
+                if job_status in ['completed', 'succeeded']:
+                    logger.info(f"Job {job_name} completed successfully")
+                    return
+                
+                if job_status in ['failed', 'error']:
+                    failure_count += 1
+                    consecutive_failures += 1
+                    
+                    logger.warning(f"Job {job_name} failed with status: {job_status} (failure #{failure_count})")
+                    
+                    # Check if we've exceeded maximum failures
+                    if failure_count >= max_failures:
+                        logger.error(f"Job {job_name} has failed {failure_count} times, exceeding maximum of {max_failures}. Terminating job.")
+                        
+                        # Attempt to delete the failed job
+                        try:
+                            await self._terminate_failed_job(job_name, namespace)
+                            logger.info(f"Successfully terminated failed job {job_name}")
+                        except Exception as terminate_error:
+                            logger.error(f"Failed to terminate job {job_name}: {terminate_error}")
+                        
+                        raise Exception(f"Job {job_name} failed {failure_count} times, exceeding maximum failures ({max_failures}). Job has been terminated.")
+                    
+                    # Wait longer before retrying after failure
+                    logger.info(f"Job {job_name} failed, waiting {JOB_FAILURE_RETRY_DELAY} seconds before next check...")
+                    await asyncio.sleep(JOB_FAILURE_RETRY_DELAY)
+                    continue
+                
+                # Reset consecutive failures if job is running again
+                if job_status in ['running', 'pending'] and last_status in ['failed', 'error']:
+                    consecutive_failures = 0
+                    logger.info(f"Job {job_name} is recovering from failure")
+                
+                last_status = job_status
+            
+            except Exception as e:
+                # Don't count connection/API errors as job failures
+                if "failed with status" in str(e) and "exceeding maximum failures" in str(e):
+                    # This is our termination exception, re-raise it
+                    raise e
+                else:
+                    # This is a connection/API error, log but don't count as failure
+                    logger.warning(f"Error checking job {job_name} status: {e}")
+            
+            # Check timeout
+            elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed > timeout:
+                logger.error(f"Timeout waiting for job {job_name} to complete after {elapsed}s (timeout: {timeout}s)")
+                
+                # Attempt to terminate the timed-out job
+                try:
+                    await self._terminate_failed_job(job_name, namespace)
+                    logger.info(f"Successfully terminated timed-out job {job_name}")
+                except Exception as terminate_error:
+                    logger.error(f"Failed to terminate timed-out job {job_name}: {terminate_error}")
+                
+                raise Exception(f"Timeout waiting for job {job_name} to complete (timeout: {timeout}s). Job has been terminated.")
+            
+            # Wait before next check
+            await asyncio.sleep(30)  # Check every 30 seconds
+
+    async def _terminate_failed_job(self, job_name: str, namespace: str):
+        """Terminate a failed job by deleting it from Kubernetes"""
+        try:
+            logger.info(f"Attempting to terminate job {job_name} in namespace {namespace}")
+            
+            # Use Kubernetes client to delete the job
+            success = await k8s_client.delete_job(job_name, namespace)
+            
+            if success:
+                logger.info(f"Job {job_name} terminated successfully")
+                
+                # Update deployment status in database
+                deployments_collection = get_deployments_collection()
+                await deployments_collection.update_many(
+                    {
+                        "resource_name": job_name,
+                        "namespace": namespace,
+                        "resource_type": {"$in": ["job", "Job"]},
+                        "status": {"$ne": "deleted"}
+                    },
+                    {"$set": {"status": "terminated", "terminated_at": datetime.now()}}
+                )
+                logger.info(f"Updated database status for terminated job {job_name}")
+            else:
+                logger.warning(f"Failed to terminate job {job_name} - job may not exist")
+                
+        except Exception as e:
+            logger.error(f"Error terminating job {job_name}: {e}")
+            raise e
+
+    async def _wait_for_deployed_job_completion(self, job_deployment_id: str, namespace: str, timeout: int = 3600):
+        """Wait for a deployed job to complete using deployment ID"""
+        import asyncio
+        from datetime import datetime
+        
+        start_time = datetime.now()
+        
+        # First, get the actual job name from the deployment
+        try:
+            deployments_collection = get_deployments_collection()
+            deployment_doc = await deployments_collection.find_one({"deployment_id": job_deployment_id})
+            
+            if not deployment_doc:
+                raise Exception(f"Deployment {job_deployment_id} not found in database")
+                
+            job_name = deployment_doc.get("resource_name")
+            if not job_name:
+                raise Exception(f"Resource name not found for deployment {job_deployment_id}")
+                
+            logger.info(f"Waiting for job {job_name} (deployment: {job_deployment_id}) to complete")
+            
+            # Now wait for the job to complete
+            await self._wait_for_benchmark_job_completion(
+                job_name=job_name,
+                namespace=namespace,
+                timeout=timeout
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to wait for job completion (deployment: {job_deployment_id}): {e}")
+            raise
+
+    async def _wait_for_vllm_ready(self, release_name: str, namespace: str, timeout: int = 600):
+        """Wait for VLLM service to be ready"""
+        import asyncio
+        import aiohttp
+        from datetime import datetime
+        
+        start_time = datetime.now()
+        logger.info(f"Waiting for VLLM service {release_name} in namespace {namespace} to be ready...")
+        
+        try:
+            # First, wait for pods to be running
+            await self._wait_for_pods_running(release_name, namespace, timeout // 2)
+            
+            # Then, check if VLLM API is responding
+            service_url = f"http://{release_name}.{namespace}.svc.cluster.local:8000"
+            health_endpoint = f"{service_url}/health"
+            
+            logger.info(f"Checking VLLM API health at {health_endpoint}")
+            
+            while True:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(health_endpoint, timeout=10) as response:
+                            if response.status == 200:
+                                logger.info(f"VLLM service {release_name} is ready and responding")
+                                return
+                            else:
+                                logger.debug(f"VLLM health check returned status {response.status}")
+                
+                except Exception as e:
+                    logger.debug(f"VLLM health check failed: {e}")
+                
+                # Check timeout
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed > timeout:
+                    error_msg = f"Timeout waiting for VLLM service {release_name} to be ready (timeout: {timeout}s)"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+                
+                # Wait before next check
+                await asyncio.sleep(15)  # Check every 15 seconds
+                
+        except Exception as e:
+            # Check if this is a queue-based deployment and terminate it
+            error_msg = f"VLLM readiness check failed for {release_name}: {str(e)}"
+            logger.error(error_msg)
+            
+            # Try to get queue request ID from release annotations/labels
+            queue_request_id = await self._get_queue_request_id_from_release(release_name, namespace)
+            if queue_request_id:
+                logger.info(f"Terminating queue request {queue_request_id} due to VLLM deployment failure")
+                await self._terminate_queue_request(queue_request_id, error_msg)
+            
+            raise Exception(error_msg)
+
+    async def _wait_for_pods_running(self, release_name: str, namespace: str, timeout: int = 600):
+        """Wait for pods to be in running state"""
+        import subprocess
+        import asyncio
+        import json
+        from datetime import datetime
+        
+        start_time = datetime.now()
+        logger.info(f"Waiting for pods of release {release_name} to be running...")
+        
+        while True:
+            try:
+                # Get pods for the release
+                cmd = [
+                    "kubectl", "get", "pods", 
+                    "-l", f"app.kubernetes.io/instance={release_name}",
+                    "-n", namespace,
+                    "-o", "json"
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    try:
+                        pods_data = json.loads(result.stdout)
+                        pods = pods_data.get("items", [])
+                        
+                        if not pods:
+                            logger.debug(f"No pods found for release {release_name}")
+                        else:
+                            all_running = True
+                            failed_pods = []
+                            
+                            for pod in pods:
+                                pod_name = pod['metadata']['name']
+                                pod_status = pod.get('status', {}).get('phase', 'Unknown')
+                                
+                                logger.debug(f"Pod {pod_name} status: {pod_status}")
+                                
+                                # Check for failed states
+                                if pod_status in ['Failed', 'Error']:
+                                    failed_pods.append(f"{pod_name}: {pod_status}")
+                                    all_running = False
+                                elif pod_status != 'Running':
+                                    # Check container statuses for more detailed error info
+                                    container_statuses = pod.get('status', {}).get('containerStatuses', [])
+                                    for container_status in container_statuses:
+                                        waiting_state = container_status.get('state', {}).get('waiting', {})
+                                        if waiting_state:
+                                            reason = waiting_state.get('reason', '')
+                                            message = waiting_state.get('message', '')
+                                            if reason in ['ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError', 'CrashLoopBackOff']:
+                                                failed_pods.append(f"{pod_name}: {reason} - {message}")
+                                    
+                                    all_running = False
+                            
+                            # If we have failed pods, raise an exception immediately
+                            if failed_pods:
+                                error_msg = f"Pods failed for release {release_name}: {'; '.join(failed_pods)}"
+                                logger.error(error_msg)
+                                
+                                # Try to get queue request ID and update status
+                                queue_request_id = await self._get_queue_request_id_from_release(release_name, namespace)
+                                if queue_request_id:
+                                    logger.info(f"Marking queue request {queue_request_id} as failed due to pod errors")
+                                    await self._mark_request_failed(queue_request_id, error_msg)
+                                
+                                raise Exception(error_msg)
+                            
+                            if all_running:
+                                logger.info(f"All pods for release {release_name} are running")
+                                return
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse kubectl output: {e}")
+                else:
+                    logger.debug(f"Failed to get pods: {result.stderr}")
+            
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse kubectl output: {e}")
+            except Exception as e:
+                # If it's our custom exception, re-raise it
+                if "Pods failed for release" in str(e):
+                    raise
+                logger.debug(f"Error checking pod status: {e}")
+            
+            # Check timeout
+            elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed > timeout:
+                error_msg = f"Timeout waiting for pods of release {release_name} to be running (timeout: {timeout}s)"
+                logger.error(error_msg)
+                
+                # Try to get queue request ID and update status for timeout
+                queue_request_id = await self._get_queue_request_id_from_release(release_name, namespace)
+                if queue_request_id:
+                    logger.info(f"Marking queue request {queue_request_id} as failed due to timeout")
+                    await self._mark_request_failed(queue_request_id, error_msg)
+                
+                raise Exception(error_msg)
+            
+            # Wait before next check
+            await asyncio.sleep(10)  # Check every 10 seconds
+
+    async def _get_queue_request_id_from_release(self, release_name: str, namespace: str) -> Optional[str]:
+        """Get queue request ID from Helm release annotations or labels"""
+        try:
+            import subprocess
+            import asyncio
+            import json
+            
+            # Try to get release info from Helm
+            get_release_cmd = [
+                "helm", "get", "values", release_name, 
+                "-n", namespace, 
+                "-o", "json"
+            ]
+            
+            result = await asyncio.create_subprocess_exec(
+                *get_release_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode == 0:
+                try:
+                    values_data = json.loads(stdout.decode())
+                    # Check if queue_request_id is stored in values
+                    queue_request_id = values_data.get('queue_request_id')
+                    if queue_request_id:
+                        return queue_request_id
+                except json.JSONDecodeError:
+                    pass
+            
+            # Fallback: try to find queue request by matching release name pattern
+            # Release names are typically created with timestamp, so we can try to match
+            queue_collection = await self._get_vllm_queue_collection()
+            async for queue_doc in queue_collection.find({"status": {"$in": ["processing", "pending"]}}):
+                # Check if this queue request might be related to this release
+                vllm_config = queue_doc.get("vllm_config", {})
+                model_name = vllm_config.get("model_name", "")
+                if model_name:
+                    clean_model_name = model_name.replace('/', '-').replace('_', '-').lower()
+                    if clean_model_name in release_name:
+                        return queue_doc["queue_request_id"]
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to get queue request ID from release {release_name}: {e}")
+            return None
+
+    async def _terminate_queue_request(self, queue_request_id: str, error_message: str):
+        """Terminate a queue request due to deployment failure"""
+        try:
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            # Update the queue request status to failed
+            update_result = await queue_collection.update_one(
+                {"queue_request_id": queue_request_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "error_message": error_message,
+                        "completed_at": datetime.now()
+                    }
+                }
+            )
+            
+            if update_result.modified_count > 0:
+                logger.info(f"Successfully terminated queue request {queue_request_id}")
+                
+                # Also update the benchmark-vllm queue if this was a Helm deployment
+                await self._update_queue_status(queue_request_id, "failed", None, error_message)
+            else:
+                logger.warning(f"Queue request {queue_request_id} not found or already processed")
+                
+        except Exception as e:
+            logger.error(f"Failed to terminate queue request {queue_request_id}: {e}")
+
+    async def _get_vllm_queue_collection(self):
+        """Get VLLM queue collection"""
+        from database import get_database
+        db = get_database()
+        return db.vllm_deployment_queue
+
+    async def start_queue_monitoring(self):
+        """Start background queue monitoring for pod status"""
+        if hasattr(self, 'monitoring_task') and self.monitoring_task and not self.monitoring_task.done():
+            logger.info("Queue monitoring already running")
+            return
+            
+        logger.info("Starting queue monitoring...")
+        self.monitoring_task = asyncio.create_task(self._queue_monitoring_loop())
+
+    async def stop_queue_monitoring(self):
+        """Stop background queue monitoring"""
+        if hasattr(self, 'monitoring_task') and self.monitoring_task:
+            self.monitoring_task.cancel()
+            try:
+                await self.monitoring_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Queue monitoring stopped")
+
+    async def _queue_monitoring_loop(self):
+        """Background loop to monitor processing queue requests"""
+        while True:
+            try:
+                await self._monitor_processing_requests()
+                await asyncio.sleep(30)  # Check every 30 seconds
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in queue monitoring loop: {e}")
+                await asyncio.sleep(30)
+
+    async def _monitor_processing_requests(self):
+        """Monitor processing queue requests for pod failures"""
+        try:
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            # Find all processing requests
+            processing_requests = []
+            async for request in queue_collection.find({"status": "processing"}):
+                processing_requests.append(request)
+            
+            for request in processing_requests:
+                queue_request_id = request["queue_request_id"]
+                current_step = request.get("current_step", "")
+                
+                # Check VLLM deployment status if in vllm_deployment step
+                if current_step == "vllm_deployment" and request.get("vllm_deployment_id"):
+                    deployment_id = request["vllm_deployment_id"]
+                    if deployment_id != "existing-vllm":  # Skip existing VLLM check
+                        await self._check_vllm_deployment_status(queue_request_id, deployment_id)
+                
+                # Check benchmark job status if in benchmark steps
+                elif current_step.startswith("benchmark_job_"):
+                    await self._check_benchmark_job_status(queue_request_id, request)
+                    
+        except Exception as e:
+            logger.error(f"Error monitoring processing requests: {e}")
+
+    async def _check_vllm_deployment_status(self, queue_request_id: str, deployment_id: str):
+        """Check VLLM deployment status and update queue if failed"""
+        try:
+            # Check deployment status from VLLM manager
+            import aiohttp
+            from config import BENCHMARK_VLLM_URL
+            
+            async with aiohttp.ClientSession() as session:
+                url = f"{BENCHMARK_VLLM_URL}/deployments/{deployment_id}/status"
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        deployment_info = await response.json()
+                        
+                        if deployment_info.get("status") == "failed":
+                            error_message = deployment_info.get("error_message", "VLLM deployment failed")
+                            logger.warning(f"VLLM deployment {deployment_id} failed, updating queue request {queue_request_id}")
+                            await self._mark_request_failed(queue_request_id, f"VLLM deployment failed: {error_message}")
+                            
+        except Exception as e:
+            logger.debug(f"Error checking VLLM deployment status: {e}")
+
+    async def _check_benchmark_job_status(self, queue_request_id: str, request: dict):
+        """Check benchmark job status and update queue if failed"""
+        try:
+            benchmark_job_ids = request.get("benchmark_job_ids", [])
+            
+            for job_id in benchmark_job_ids:
+                # Check job status
+                try:
+                    job_status = await k8s_client.get_job_status(job_id, request.get("namespace", "default"))
+                    
+                    if job_status.status.value == "failed":
+                        error_message = f"Benchmark job {job_id} failed"
+                        logger.warning(f"Benchmark job {job_id} failed, updating queue request {queue_request_id}")
+                        await self._mark_request_failed(queue_request_id, error_message)
+                        return
+                        
+                except Exception as job_error:
+                    logger.debug(f"Error checking job {job_id}: {job_error}")
+                    
+        except Exception as e:
+            logger.debug(f"Error checking benchmark job status: {e}")
+
+    async def delete_job(self, job_name: str, namespace: str) -> bool:
+        """Delete a job by name"""
+        try:
+            logger.info(f"Deleting job '{job_name}' in namespace '{namespace}'")
+            
+            # Use Kubernetes client to delete the job
+            success = await k8s_client.delete_job(job_name, namespace)
+            
+            if success:
+                # Update deployment status in database
+                deployments_collection = get_deployments_collection()
+                result = await deployments_collection.update_many(
+                    {
+                        "resource_name": job_name,
+                        "namespace": namespace,
+                        "resource_type": {"$in": ["job", "Job"]},
+                        "status": {"$ne": "deleted"}
+                    },
+                    {"$set": {"status": "deleted", "deleted_at": datetime.now()}}
+                )
+                
+                if result.modified_count > 0:
+                    logger.info(f"Updated database status for deleted job {job_name} ({result.modified_count} records)")
+                
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error deleting job {job_name}: {e}")
+            raise Exception(f"Failed to delete job: {str(e)}")
+
+    async def cancel_vllm_queue_request(self, queue_request_id: str) -> bool:
+        """Cancel a VLLM queue request and clean up resources"""
+        try:
+            logger.info(f"Attempting to cancel VLLM queue request {queue_request_id}")
+            
+            # Get queue collection
+            queue_collection = await self._get_vllm_queue_collection()
+            
+            # Find the queue request
+            queue_request = await queue_collection.find_one({"queue_request_id": queue_request_id})
+            if not queue_request:
+                logger.warning(f"Queue request {queue_request_id} not found")
+                return False
+            
+            # Only allow cancellation of pending or processing requests
+            if queue_request.get("status") not in ["pending", "processing"]:
+                logger.warning(f"Cannot cancel queue request {queue_request_id} with status {queue_request.get('status')}")
+                return False
+            
+            logger.info(f"Cancelling queue request {queue_request_id} with status {queue_request.get('status')}")
+            
+            # Clean up resources if processing
+            if queue_request.get("status") == "processing":
+                await self._cleanup_processing_vllm_request(queue_request_id, queue_request)
+            
+            # Update status to cancelled
+            await queue_collection.update_one(
+                {"queue_request_id": queue_request_id},
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "completed_at": datetime.now(),
+                        "error_message": "Cancelled by user"
+                    }
+                }
+            )
+            
+            logger.info(f"Successfully cancelled VLLM queue request {queue_request_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error cancelling VLLM queue request {queue_request_id}: {e}")
+            return False
+
+    async def _cleanup_processing_vllm_request(self, queue_request_id: str, queue_request: dict):
+        """Clean up resources for a processing VLLM request"""
+        try:
+            logger.info(f"Cleaning up processing VLLM request {queue_request_id}")
+            
+            # 1. Clean up benchmark jobs
+            benchmark_job_ids = queue_request.get("benchmark_job_ids", [])
+            if benchmark_job_ids:
+                logger.info(f"Cleaning up {len(benchmark_job_ids)} benchmark jobs")
+                for job_id in benchmark_job_ids:
+                    try:
+                        # Try to get job name from deployments collection
+                        deployments_collection = get_deployments_collection()
+                        deployment_doc = await deployments_collection.find_one({"deployment_id": job_id})
+                        
+                        if deployment_doc:
+                            job_name = deployment_doc.get("resource_name")
+                            namespace = deployment_doc.get("namespace", "default")
+                            
+                            if job_name:
+                                logger.info(f"Deleting benchmark job {job_name} in namespace {namespace}")
+                                await self.delete_job(job_name, namespace)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up benchmark job {job_id}: {e}")
+                        continue
+            
+            # 2. Clean up VLLM deployment if it was created by this request
+            vllm_deployment_id = queue_request.get("vllm_deployment_id")
+            if vllm_deployment_id and vllm_deployment_id != "existing-vllm":
+                logger.info(f"Cleaning up VLLM deployment {vllm_deployment_id}")
+                
+                # Check if other requests are using this deployment
+                other_requests = await self._get_vllm_queue_collection().find({
+                    "vllm_deployment_id": vllm_deployment_id,
+                    "queue_request_id": {"$ne": queue_request_id},
+                    "status": {"$in": ["pending", "processing"]}
+                }).to_list(length=None)
+                
+                if not other_requests:
+                    # No other requests using this deployment, safe to delete
+                    try:
+                        # Call VLLM service to stop deployment
+                        import aiohttp
+                        from config import BENCHMARK_VLLM_URL
+                        
+                        async with aiohttp.ClientSession() as session:
+                            delete_url = f"{BENCHMARK_VLLM_URL}/deployments/{vllm_deployment_id}"
+                            async with session.delete(delete_url) as response:
+                                if response.status in [200, 204, 404]:
+                                    logger.info(f"Successfully deleted VLLM deployment {vllm_deployment_id}")
+                                else:
+                                    error_text = await response.text()
+                                    logger.warning(f"Failed to delete VLLM deployment: HTTP {response.status} - {error_text}")
+                    
+                    except Exception as e:
+                        logger.warning(f"Error deleting VLLM deployment {vllm_deployment_id}: {e}")
+                else:
+                    logger.info(f"VLLM deployment {vllm_deployment_id} is used by {len(other_requests)} other requests, not deleting")
+            
+            logger.info(f"Completed cleanup for VLLM request {queue_request_id}")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup of VLLM request {queue_request_id}: {e}")
+
+# Global instance
 deployer_manager = DeployerManager() 

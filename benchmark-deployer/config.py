@@ -20,6 +20,10 @@ LOG_FOLLOW_TIMEOUT = int(os.getenv("LOG_FOLLOW_TIMEOUT", "300"))  # 5 minutes
 # Deployment Configuration
 DEPLOYMENT_TIMEOUT = int(os.getenv("DEPLOYMENT_TIMEOUT", "600"))  # 10 minutes
 
+JOB_MAX_FAILURES = int(os.getenv("JOB_MAX_FAILURES", "3"))  # Maximum failures before termination
+JOB_FAILURE_RETRY_DELAY = int(os.getenv("JOB_FAILURE_RETRY_DELAY", "60"))  # Seconds to wait after failure
+JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "3600"))  # Default job timeout in seconds
+
 # -----------------------------------------------------------------------------
 # MongoDB Configuration
 # -----------------------------------------------------------------------------

@@ -19,13 +19,17 @@ async def create_project(project_data: ProjectCreate) -> Project:
     project_id = str(uuid4())
     now = datetime.now()
     
+    logging.info(f"Creating project with data: {project_data.dict()}")
+    
     project_doc = {
         "project_id": project_id,
         "name": project_data.name,
+        "project_type": project_data.project_type or "benchmark",
         "repository_url": project_data.repository_url,
         "github_token": project_data.github_token,
-        "config_path": project_data.config_path,
-        "job_path": project_data.job_path,
+        "config_path": project_data.config_path or "config",
+        "job_path": project_data.job_path or "job",
+        "vllm_values_path": project_data.vllm_values_path or "",
         "polling_interval": project_data.polling_interval,
         "created_at": now,
         "updated_at": now,
@@ -50,6 +54,11 @@ async def get_project(project_id: str) -> Optional[Project]:
     project_doc = await collection.find_one({"project_id": project_id}, {"_id": 0})
     
     if project_doc:
+        # 기존 프로젝트에 새로운 필드가 없는 경우 기본값 설정
+        if "project_type" not in project_doc:
+            project_doc["project_type"] = "benchmark"
+        if "vllm_values_path" not in project_doc:
+            project_doc["vllm_values_path"] = ""
         return Project(**project_doc)
     return None
 
@@ -60,6 +69,11 @@ async def list_projects() -> List[Project]:
     projects = []
     
     async for doc in cursor:
+        # 기존 프로젝트에 새로운 필드가 없는 경우 기본값 설정
+        if "project_type" not in doc:
+            doc["project_type"] = "benchmark"
+        if "vllm_values_path" not in doc:
+            doc["vllm_values_path"] = ""
         projects.append(Project(**doc))
     
     return projects
@@ -170,7 +184,13 @@ async def sync_project_files(project_id: str) -> SyncResponse:
     try:
         github_client = create_github_client(project.repository_url, project.github_token)
         
-        all_files = await github_client.fetch_all_files(project.config_path, project.job_path)
+        # 프로젝트 타입에 따라 다른 파일 fetch 로직 사용
+        if project.project_type == "vllm":
+            # VLLM 프로젝트의 경우 custom-values*.yaml 파일들을 찾음
+            all_files = await github_client.fetch_vllm_files(project.vllm_values_path)
+        else:
+            # Benchmark 프로젝트의 경우 기존 로직 사용
+            all_files = await github_client.fetch_all_files(project.config_path, project.job_path)
         
         files_collection = get_original_files_collection()
         synced_count = 0
