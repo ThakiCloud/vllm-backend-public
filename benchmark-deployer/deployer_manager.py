@@ -1146,9 +1146,6 @@ class DeployerManager:
                         else:
                             logger.warning(f"Failed to fetch project information: {response.status}")
             
-            # First, register this Helm deployment request in the benchmark-vllm queue
-            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token, values_content)
-            
             # Get custom values file content if specified (GitHub token already retrieved above)
             values_content = None
             if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
@@ -1157,19 +1154,9 @@ class DeployerManager:
                     request.vllm_helm_config.values_file_id,
                     github_token
                 )
-            if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
-                logger.info(f"Fetching custom values file: {request.vllm_helm_config.values_file_id}")
-                
-                from config import BENCHMARK_MANAGER_URL
-                async with aiohttp.ClientSession() as session:
-                    file_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}/files/{request.vllm_helm_config.values_file_id}"
-                    async with session.get(file_url) as response:
-                        if response.status == 200:
-                            file_data = await response.json()
-                            values_content = file_data.get('file', {}).get('content', '')
-                            logger.info(f"Retrieved custom values file content: {len(values_content)} characters")
-                        else:
-                            logger.warning(f"Failed to fetch custom values file: {response.status}")
+            
+            # First, register this Helm deployment request in the benchmark-vllm queue
+            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token, values_content)
             
             # Create temporary values file
             values_file_path = None
@@ -1447,6 +1434,43 @@ class DeployerManager:
             logger.warning(f"Failed to register Helm deployment in queue: {e}")
             # Don't fail the deployment if queue registration fails
             return None
+
+    async def _get_values_file_content(self, project_id: str, values_file_id: str, github_token: str = None) -> str:
+        """Get custom values file content from manager API"""
+        try:
+            import aiohttp
+            from config import BENCHMARK_MANAGER_URL
+            
+            logger.info(f"Fetching custom values file: {values_file_id} from project: {project_id}")
+            
+            async with aiohttp.ClientSession() as session:
+                file_url = f"{BENCHMARK_MANAGER_URL}/projects/{project_id}/files/{values_file_id}"
+                headers = {}
+                if github_token:
+                    headers["Authorization"] = f"Bearer {github_token}"
+                
+                async with session.get(file_url, headers=headers) as response:
+                    if response.status == 200:
+                        file_data = await response.json()
+                        
+                        # Handle different response formats
+                        if 'file' in file_data:
+                            content = file_data['file'].get('content', '')
+                        elif 'content' in file_data:
+                            content = file_data['content']
+                        else:
+                            content = str(file_data)
+                            
+                        logger.info(f"Retrieved custom values file content: {len(content)} characters")
+                        return content
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"Failed to fetch custom values file: {response.status} - {error_text}")
+                        return ""
+                        
+        except Exception as e:
+            logger.warning(f"Error fetching custom values file: {e}")
+            return ""
 
     async def _should_upgrade_helm_release(self, request: VLLMHelmDeploymentRequest) -> str:
         """
