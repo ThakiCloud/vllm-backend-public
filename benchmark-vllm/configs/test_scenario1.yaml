@@ -1,0 +1,19 @@
+model_name: "Qwen/Qwen2-1.5B-Instruct"  # TinyLLaMA Chat 모델로 변경
+gpu_memory_utilization: 0.0                       # CPU만 사용
+max_num_seqs: 2                                   # CPU 모드라 작은 배치
+block_size: 16                                    # CPU에서 안정적인 값 유지
+tensor_parallel_size: 1                           # CPU 모드라 병렬화 필요 없음
+pipeline_parallel_size: 1
+trust_remote_code: false
+dtype: "float32"                                  # float32 (CPU 안정적)
+max_model_len: 512                                # CPU 모드에 맞춰 축소
+served_model_name: "test-model-cpu-1"              # 모델 이름도 변경
+port: 8000
+host: "0.0.0.0"
+gpu_resource_type: "cpu"
+gpu_resource_count: 0
+additional_args:
+  disable-log-stats: true
+  disable-log-requests: true
+  enforce-eager: true
+  disable-custom-all-reduce: true  

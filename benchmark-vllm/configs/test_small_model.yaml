@@ -1,0 +1,30 @@
+# 안정적인 CPU 모드 테스트용 설정
+# 작은 모델과 최소 리소스로 안정성 우선
+
+model_name: "microsoft/DialoGPT-small"  # 매우 작은 모델 (117M parameters)
+gpu_memory_utilization: 0.0
+max_num_seqs: 1                         # 최소한의 시퀀스
+block_size: 8                          # 작은 블록 사이즈
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+trust_remote_code: false
+dtype: "float32"
+max_model_len: 128                     # 매우 짧은 최대 길이
+quantization: null                     # 양자화 비활성화 (안정성 우선)
+served_model_name: "test-small-model"
+port: 8000
+host: "0.0.0.0"
+gpu_resource_type: "cpu"
+gpu_resource_count: 0
+
+# CPU 모드 최적화 설정
+additional_args:
+  disable-log-stats: true
+  disable-log-requests: true
+  enforce-eager: true
+  disable-custom-all-reduce: true
+  worker-use-ray: false
+  max-parallel-loading-workers: 1
+  load-format: "auto"
+  swap-space: 0                        # 스왑 비활성화
+  cpu-offload-gb: 0                   # CPU 오프로드 비활성화 
