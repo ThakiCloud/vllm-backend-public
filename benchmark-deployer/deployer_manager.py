@@ -1031,7 +1031,7 @@ class DeployerManager:
         )
         logger.info(f"Marked queue request {queue_request_id} as failed: {error_message}")
 
-    async def _ensure_latest_charts(self, chart_dir="/tmp/charts"):
+    async def _ensure_latest_charts(self, chart_dir="/tmp/app-charts"):
         """Ensure we have the latest charts from GitHub"""
         import subprocess
         import os
@@ -1184,11 +1184,8 @@ class DeployerManager:
                 
                 # If no local chart found, try to use a remote chart
                 if not chart_path:
-                    logger.warning(f"No local chart found. Attempting to use remote chart...")
-                    # You could add logic here to clone a remote chart repository
-                    # For now, let's try a common Helm repository
-                    chart_path = "vllm/vllm"  # This would be a chart from a Helm repository
-                    logger.info(f"Using remote chart: {chart_path}")
+                    logger.error(f"No local chart found and GitHub clone failed. Cannot proceed with Helm deployment.")
+                    raise Exception("Unable to find VLLM Helm chart. GitHub clone failed and no local charts available.")
                 
                 logger.info(f"Final chart path: {chart_path}")
                 

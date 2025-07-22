@@ -250,17 +250,34 @@ async def get_queue_request(queue_request_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/queue/{queue_request_id}")
-async def delete_queue_request(queue_request_id: str):
+async def delete_queue_request(queue_request_id: str, force: bool = False):
     """Delete a queue request"""
     try:
-        success = await queue_manager.delete_queue_request(queue_request_id)
+        success = await queue_manager.delete_queue_request(queue_request_id, force=force)
         if not success:
-            raise HTTPException(status_code=404, detail="Queue request not found or cannot be deleted")
+            if force:
+                raise HTTPException(status_code=404, detail="Queue request not found")
+            else:
+                raise HTTPException(status_code=400, detail="Queue request not found or cannot be deleted (try with force=true for processing requests)")
         return {"message": f"Queue request {queue_request_id} deleted successfully"}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to delete queue request: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/queue/{queue_request_id}/force")
+async def force_delete_queue_request(queue_request_id: str):
+    """Force delete a queue request regardless of status"""
+    try:
+        success = await queue_manager.force_delete_queue_request(queue_request_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Queue request not found")
+        return {"message": f"Queue request {queue_request_id} force deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to force delete queue request: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/queue/{queue_request_id}/cancel")

@@ -420,10 +420,10 @@ class QueueManager:
             logger.error(f"Failed to update queue request status {queue_request_id}: {e}")
             return False
 
-    async def delete_queue_request(self, queue_request_id: str) -> bool:
-        """Delete a queue request (only pending or completed/failed requests)"""
+    async def delete_queue_request(self, queue_request_id: str, force: bool = False) -> bool:
+        """Delete a queue request (only pending or completed/failed requests, unless force=True)"""
         try:
-            logger.info(f"Attempting to delete queue request {queue_request_id}")
+            logger.info(f"Attempting to delete queue request {queue_request_id} (force={force})")
             logger.info(f"Current queue_requests keys: {list(self.queue_requests.keys())}")
             
             if queue_request_id not in self.queue_requests:
@@ -438,10 +438,21 @@ class QueueManager:
             queue_doc = self.queue_requests[queue_request_id]
             logger.info(f"Found queue request {queue_request_id} with status: {queue_doc['status']}")
             
-            # Only allow deletion of non-processing requests
-            if queue_doc["status"] == "processing":
-                logger.warning(f"Cannot delete queue request {queue_request_id} - currently processing")
+            # If force=True, allow deletion of any status including processing
+            # If force=False, only allow deletion of non-processing requests
+            if not force and queue_doc["status"] == "processing":
+                logger.warning(f"Cannot delete queue request {queue_request_id} - currently processing. Use force=True to override.")
                 return False
+            
+            # If processing and force=True, perform cleanup first
+            if force and queue_doc["status"] == "processing":
+                logger.info(f"Force deleting processing request {queue_request_id} - performing cleanup first")
+                try:
+                    await self._cleanup_processing_request(queue_request_id, queue_doc)
+                    logger.info(f"Cleanup completed for force-deleted request {queue_request_id}")
+                except Exception as e:
+                    logger.error(f"Error during cleanup of force-deleted request {queue_request_id}: {e}")
+                    # Continue with deletion even if cleanup fails
             
             # Remove from memory
             del self.queue_requests[queue_request_id]
@@ -455,6 +466,10 @@ class QueueManager:
         except Exception as e:
             logger.error(f"Failed to delete queue request {queue_request_id}: {e}")
             return False
+
+    async def force_delete_queue_request(self, queue_request_id: str) -> bool:
+        """Force delete a queue request regardless of status"""
+        return await self.delete_queue_request(queue_request_id, force=True)
 
     async def start_scheduler(self):
         """Start the queue scheduler"""

@@ -29,14 +29,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create directory for kubeconfig and temp charts
-RUN mkdir -p /root/.kube /tmp/charts
+# Create non-root user first
+RUN useradd --create-home --shell /bin/bash app
 
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app \
-    && mkdir -p /home/app/.kube /home/app/tmp \
-    && chown -R app:app /home/app
+# Create directories with proper ownership
+RUN mkdir -p /root/.kube /home/app/.kube /home/app/charts /tmp/app-charts \
+    && chown -R app:app /app /home/app /tmp/app-charts \
+    && chmod 755 /tmp/app-charts
+
 USER app
 
 # Expose port
