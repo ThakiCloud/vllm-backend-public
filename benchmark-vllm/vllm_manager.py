@@ -23,6 +23,11 @@ class VLLMManager:
         self.db = get_database()
         self._load_kubernetes_client()
         
+    async def initialize(self):
+        """Initialize the VLLM manager (async initialization if needed)"""
+        logger.info("VLLMManager initialized successfully")
+        return True
+        
     def _load_kubernetes_client(self):
         """Load Kubernetes client configuration"""
         try:
