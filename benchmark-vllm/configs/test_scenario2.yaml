@@ -1,0 +1,21 @@
+# 테스트 시나리오 2: 동일한 설정 (재사용 테스트)
+model_name: "microsoft/DialoGPT-small"
+gpu_memory_utilization: 0.0  # CPU 모드에서는 0
+max_num_seqs: 2  # CPU 모드에서는 더 작은 배치 크기
+block_size: 16  # CPU 환경에서 안정적인 블록 크기
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+trust_remote_code: false
+dtype: "float32"  # CPU에서는 float32가 더 안정적
+max_model_len: 256  # CPU 모드에서는 더 작은 컨텍스트 길이
+quantization: null
+served_model_name: "test-model-cpu-2"
+port: 8000
+host: "0.0.0.0"
+gpu_resource_type: "cpu"
+gpu_resource_count: 0
+additional_args:
+  disable-log-stats: true
+  disable-log-requests: true
+  enforce-eager: true
+  disable-custom-all-reduce: true

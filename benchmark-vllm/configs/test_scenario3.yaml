@@ -1,0 +1,18 @@
+# 테스트 시나리오 3: 다른 설정 (충돌 테스트)
+model_name: "microsoft/DialoGPT-medium"
+gpu_memory_utilization: 0.2
+max_num_seqs: 32
+block_size: 16
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+trust_remote_code: false
+dtype: "auto"
+max_model_len: 1024
+quantization: null
+served_model_name: "test-model-3"
+port: 8001
+host: "0.0.0.0"
+gpu_resource_type: "cpu"
+gpu_resource_count: 0
+additional_args:
+  disable-log-stats: true 

@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-vllm
+  namespace: vllm
+  labels:
+    app: benchmark-vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: benchmark-vllm
+  template:
+    metadata:
+      labels:
+        app: benchmark-vllm
+    spec:
+      containers:
+      - name: benchmark-vllm
+        image: benchmark-vllm:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8005
+          name: http
+        env:
+        - name: SERVER_HOST
+          value: "0.0.0.0"
+        - name: SERVER_PORT
+          value: "8005"
+        - name: MONGO_URL
+          value: "mongodb://mongo-primary.default.svc.cluster.local:27017/?directConnection=true&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000"
+        - name: DATABASE_NAME
+          value: "benchmark_vllm"
+        - name: VLLM_CONFIG_DIR
+          value: "/app/configs"
+        - name: DEFAULT_CONFIG_FILE
+          value: "vllm_config.yaml"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/configs
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8005
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8005
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: config-volume
+        configMap:
+          name: vllm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: benchmark-vllm-service
+  namespace: vllm
+  labels:
+    app: benchmark-vllm
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8005
+    targetPort: 8005
+    protocol: TCP
+    name: http
+  selector:
+    app: benchmark-vllm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: vllm
+data:
+  vllm_config.yaml: |
+    model_name: "microsoft/DialoGPT-medium"
+    gpu_memory_utilization: 0.9
+    max_num_seqs: 256
+    block_size: 16
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    trust_remote_code: false
+    dtype: "auto"
+    max_model_len: null
+    quantization: null
+    served_model_name: null
+    port: 8000
+    host: "0.0.0.0"
+    additional_args: {}

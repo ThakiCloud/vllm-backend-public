@@ -1,0 +1,48 @@
+# Default vLLM Configuration
+model_name: "Qwen/Qwen2-1.5B-Instruct"
+gpu_memory_utilization: 0.0
+max_num_seqs: 2
+block_size: 16
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+trust_remote_code: false
+dtype: "float32"
+max_model_len: 512
+quantization: null
+served_model_name: "test-model-cpu"
+port: 8000
+host: "0.0.0.0"
+# GPU Resource Configuration
+gpu_resource_type: "cpu"
+gpu_resource_count: 0
+additional_args:
+  disable-log-stats: true
+  disable-log-requests: true
+  enforce-eager: true
+  disable-custom-all-reduce: true
+
+# Example configurations for different models:
+# 
+# For larger models:
+# model_name: "meta-llama/Llama-2-7b-chat-hf"
+# gpu_memory_utilization: 0.8
+# max_num_seqs: 128
+# tensor_parallel_size: 2
+# gpu_resource_type: "nvidia.com/gpu"
+# gpu_resource_count: 2
+# 
+# For quantized models:
+# model_name: "TheBloke/Llama-2-7B-Chat-GPTQ"
+# quantization: "gptq"
+# 
+# For custom serving:
+# served_model_name: "my-custom-model"
+# port: 8001
+#
+# For MIG GPU resources:
+# gpu_resource_type: "nvidia.com/mig-3g.20gb"
+# gpu_resource_count: 1
+# 
+# For MIG 4g resources:
+# gpu_resource_type: "nvidia.com/mig-4g.24gb"
+# gpu_resource_count: 1
