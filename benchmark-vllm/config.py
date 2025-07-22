@@ -10,14 +10,16 @@ QUEUE_SCHEDULER_AUTO_START = os.getenv("QUEUE_SCHEDULER_AUTO_START", "true").low
 QUEUE_SCHEDULER_POLL_INTERVAL = int(os.getenv("QUEUE_SCHEDULER_POLL_INTERVAL", "30"))  # seconds
 
 # Job failure tracking configuration
-JOB_MAX_FAILURES = int(os.getenv("JOB_MAX_FAILURES", "3"))  # Maximum failures before termination
-JOB_FAILURE_RETRY_DELAY = int(os.getenv("JOB_FAILURE_RETRY_DELAY", "60"))  # Seconds to wait after failure
-JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "3600"))  # Default job timeout in seconds
+# 🚨 중요: 이 값들을 너무 높게 설정하면 실패한 작업이 오랫동안 리소스를 점유할 수 있습니다
+JOB_MAX_FAILURES = int(os.getenv("JOB_MAX_FAILURES", "3"))  # 최대 실패 횟수 (권장: 2-5)
+JOB_FAILURE_RETRY_DELAY = int(os.getenv("JOB_FAILURE_RETRY_DELAY", "60"))  # 실패 후 재시도 대기 시간(초)
+JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "3600"))  # Job 최대 실행 시간(초) - 기본 1시간
 
-# VLLM failure tracking configuration
-VLLM_MAX_FAILURES = int(os.getenv("VLLM_MAX_FAILURES", "3"))  # Maximum VLLM deployment failures before termination
-VLLM_FAILURE_RETRY_DELAY = int(os.getenv("VLLM_FAILURE_RETRY_DELAY", "30"))  # Seconds to wait after VLLM failure
-VLLM_TIMEOUT = int(os.getenv("VLLM_TIMEOUT", "600"))  # Default VLLM deployment timeout in seconds
+# VLLM failure tracking configuration  
+# 🚨 중요: VLLM 배포 실패는 전체 큐 요청 실패로 이어지므로 신중하게 설정하세요
+VLLM_MAX_FAILURES = int(os.getenv("VLLM_MAX_FAILURES", "3"))  # 최대 실패 횟수 (권장: 2-3)
+VLLM_FAILURE_RETRY_DELAY = int(os.getenv("VLLM_FAILURE_RETRY_DELAY", "30"))  # 실패 후 재시도 대기 시간(초)
+VLLM_TIMEOUT = int(os.getenv("VLLM_TIMEOUT", "600"))  # VLLM 배포 최대 대기 시간(초) - 기본 10분
 
 # Service URLs
 DEPLOYER_SERVICE_URL = os.getenv("DEPLOYER_SERVICE_URL", "http://localhost:8002")

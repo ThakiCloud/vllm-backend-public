@@ -35,6 +35,24 @@ spec:
           value: "/app/configs"
         - name: DEFAULT_CONFIG_FILE
           value: "vllm_config.yaml"
+        # 실패 횟수 및 타임아웃 설정
+        - name: VLLM_MAX_FAILURES
+          value: "2"  # vLLM 배포 최대 실패 횟수 (기본값보다 낮게 설정)
+        - name: VLLM_FAILURE_RETRY_DELAY
+          value: "30"  # vLLM 실패 후 재시도 대기 시간(초)
+        - name: VLLM_TIMEOUT
+          value: "600"  # vLLM 배포 타임아웃(초) - 10분
+        - name: JOB_MAX_FAILURES
+          value: "3"  # Job 최대 실패 횟수
+        - name: JOB_FAILURE_RETRY_DELAY
+          value: "60"  # Job 실패 후 재시도 대기 시간(초)
+        - name: JOB_TIMEOUT
+          value: "3600"  # Job 타임아웃(초) - 1시간
+        # 큐 스케줄러 설정
+        - name: QUEUE_SCHEDULER_AUTO_START
+          value: "true"
+        - name: QUEUE_SCHEDULER_POLL_INTERVAL
+          value: "30"
         volumeMounts:
         - name: config-volume
           mountPath: /app/configs

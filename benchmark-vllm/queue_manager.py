@@ -613,7 +613,7 @@ class QueueManager:
                             
                             # Wait for VLLM to be ready (this can now fail after 3 attempts)
                             logger.info(f"Waiting for VLLM Helm deployment {deployment_response.deployment_id} to be ready...")
-                            await self._wait_for_vllm_ready(
+                            await vllm_manager.wait_for_helm_deployment_ready(
                                 deployment_response.deployment_id,
                                 timeout=VLLM_TIMEOUT,
                                 max_failures=VLLM_MAX_FAILURES,
@@ -882,27 +882,32 @@ class QueueManager:
                 return result
 
     async def _wait_for_job_completion(self, job_name: str, namespace: str, deployer_base_url: str, timeout: int = 3600, max_failures: int = 3):
-        """Wait for a benchmark job to complete with failure tracking"""
+        """Wait for job completion with failure tracking and retry logic"""
         start_time = datetime.utcnow()
         failure_count = 0
         consecutive_failures = 0
         last_status = None
+        check_count = 0  # 총 체크 횟수 추적
+        max_checks = timeout // 30 + 10  # 최대 체크 횟수 제한 (안전장치)
         
-        while True:
+        logger.info(f"Waiting for job {job_name} to complete (timeout: {timeout}s, max_failures: {max_failures})")
+        
+        while check_count < max_checks:
+            check_count += 1
+            
             try:
-                # Get job status from Benchmark Deployer
-                status_url = f"{deployer_base_url}/jobs/{job_name}/status"
-                params = {"namespace": namespace}
-                
                 async with aiohttp.ClientSession() as session:
+                    status_url = f"{deployer_base_url}/jobs/{job_name}/status"
+                    params = {"namespace": namespace}
+                    
                     async with session.get(status_url, params=params) as response:
                         if response.status == 200:
                             status_data = await response.json()
-                            job_status = status_data.get('status', '').lower()
+                            job_status = status_data.get("status", "unknown").lower()
                             
-                            logger.debug(f"Job {job_name} status: {job_status}")
+                            logger.debug(f"Job {job_name} status: {job_status} (check #{check_count})")
                             
-                            if job_status in ['completed', 'succeeded']:
+                            if job_status in ['succeeded', 'completed']:
                                 logger.info(f"Job {job_name} completed successfully")
                                 return
                             
@@ -910,30 +915,30 @@ class QueueManager:
                                 failure_count += 1
                                 consecutive_failures += 1
                                 
-                                logger.warning(f"Job {job_name} failed with status: {job_status} (failure #{failure_count})")
+                                logger.warning(f"Job {job_name} failed with status: {job_status} (failure #{failure_count}/{max_failures}, check #{check_count})")
                                 
                                 # Check if we've exceeded maximum failures
                                 if failure_count >= max_failures:
-                                    logger.error(f"Job {job_name} has failed {failure_count} times, exceeding maximum of {max_failures}. Terminating job.")
+                                    logger.error(f"🚨 Job {job_name} has failed {failure_count} times, exceeding maximum of {max_failures}. Terminating job.")
                                     
                                     # Attempt to delete the failed job
                                     try:
                                         await self._terminate_failed_job(job_name, namespace, deployer_base_url)
-                                        logger.info(f"Successfully terminated failed job {job_name}")
+                                        logger.info(f"✅ Successfully terminated failed job {job_name}")
                                     except Exception as terminate_error:
-                                        logger.error(f"Failed to terminate job {job_name}: {terminate_error}")
+                                        logger.error(f"❌ Failed to terminate job {job_name}: {terminate_error}")
                                     
                                     raise Exception(f"Job {job_name} failed {failure_count} times, exceeding maximum failures ({max_failures}). Job has been terminated.")
                                 
                                 # Wait longer before retrying after failure
-                                logger.info(f"Job {job_name} failed, waiting {JOB_FAILURE_RETRY_DELAY} seconds before next check...")
+                                logger.info(f"⏳ Job {job_name} failed, waiting {JOB_FAILURE_RETRY_DELAY} seconds before next check...")
                                 await asyncio.sleep(JOB_FAILURE_RETRY_DELAY)
                                 continue
                             
                             # Reset consecutive failures if job is running again
                             if job_status in ['running', 'pending'] and last_status in ['failed', 'error']:
                                 consecutive_failures = 0
-                                logger.info(f"Job {job_name} is recovering from failure")
+                                logger.info(f"🔄 Job {job_name} is recovering from failure")
                             
                             last_status = job_status
                         
@@ -952,24 +957,34 @@ class QueueManager:
                     raise e
                 else:
                     # This is a connection/API error, log but don't count as failure
-                    logger.warning(f"Error checking job {job_name} status: {e}")
+                    logger.warning(f"Error checking job {job_name} status (check #{check_count}): {e}")
             
             # Check timeout
             elapsed = (datetime.utcnow() - start_time).total_seconds()
             if elapsed > timeout:
-                logger.error(f"Timeout waiting for job {job_name} to complete after {elapsed}s (timeout: {timeout}s)")
+                logger.error(f"🕐 Timeout waiting for job {job_name} to complete after {elapsed}s (timeout: {timeout}s, checks: {check_count})")
                 
                 # Attempt to terminate the timed-out job
                 try:
                     await self._terminate_failed_job(job_name, namespace, deployer_base_url)
-                    logger.info(f"Successfully terminated timed-out job {job_name}")
+                    logger.info(f"✅ Successfully terminated timed-out job {job_name}")
                 except Exception as terminate_error:
-                    logger.error(f"Failed to terminate timed-out job {job_name}: {terminate_error}")
+                    logger.error(f"❌ Failed to terminate timed-out job {job_name}: {terminate_error}")
                 
                 raise Exception(f"Timeout waiting for job {job_name} to complete (timeout: {timeout}s). Job has been terminated.")
             
             # Wait before next check
             await asyncio.sleep(30)  # Check every 30 seconds
+        
+        # If we've exceeded max checks, something is wrong
+        logger.error(f"🚨 Exceeded maximum checks ({max_checks}) for job {job_name}. Terminating due to safety limit.")
+        try:
+            await self._terminate_failed_job(job_name, namespace, deployer_base_url)
+            logger.info(f"✅ Successfully terminated job {job_name} due to check limit")
+        except Exception as terminate_error:
+            logger.error(f"❌ Failed to terminate job {job_name}: {terminate_error}")
+        
+        raise Exception(f"Job {job_name} exceeded maximum check limit ({max_checks}). Job has been terminated for safety.")
 
     async def _terminate_failed_job(self, job_name: str, namespace: str, deployer_base_url: str):
         """Terminate a failed job by deleting it from Kubernetes"""

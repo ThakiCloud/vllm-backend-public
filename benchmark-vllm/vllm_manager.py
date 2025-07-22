@@ -7,9 +7,9 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
-from .models import VLLMConfig, VLLMDeployment, VLLMDeploymentResponse
-from .database import get_database
-from .vllm_templates import create_vllm_deployment_template, create_vllm_statefulset_template, create_vllm_service_template
+from models import VLLMConfig, VLLMDeployment, VLLMDeploymentResponse
+from database import get_database
+from vllm_templates import create_vllm_deployment_template, create_vllm_statefulset_template, create_vllm_service_template
 import logging
 
 logger = logging.getLogger(__name__)
@@ -396,6 +396,175 @@ class VLLMManager:
             logger.info(f"Updated deployment {deployment.deployment_id} in database")
         except Exception as e:
             logger.error(f"Failed to update deployment in database: {e}")
+
+    async def wait_for_helm_deployment_ready(self, deployment_id: str, timeout: int = 600, max_failures: int = 3, failure_retry_delay: int = 30):
+        """Wait for Helm-based vLLM deployment to be ready with failure tracking"""
+        start_time = datetime.utcnow()
+        failure_count = 0
+        consecutive_failures = 0
+        last_status = None
+        
+        logger.info(f"Waiting for Helm vLLM deployment {deployment_id} to be ready (timeout: {timeout}s, max_failures: {max_failures})")
+        
+        while True:
+            try:
+                deployment = await self.get_deployment_status(deployment_id)
+                if not deployment:
+                    raise Exception(f"Deployment {deployment_id} not found")
+                
+                # Check Helm release status
+                helm_status = await self._check_helm_release_status(deployment.helm_release_name, deployment.namespace)
+                current_status = helm_status.get('status', 'unknown').lower()
+                
+                logger.debug(f"Helm deployment {deployment_id} status: {current_status}")
+                
+                if current_status in ["deployed", "running"]:
+                    # Additional check: verify pod is actually ready
+                    pod_ready = await self._check_pod_readiness(deployment.helm_release_name, deployment.namespace)
+                    if pod_ready:
+                        logger.info(f"Helm vLLM deployment {deployment_id} is ready")
+                        # Update deployment status
+                        deployment.status = "running"
+                        deployment.updated_at = datetime.utcnow()
+                        self.deployments[deployment_id] = deployment
+                        await self._update_deployment_in_db(deployment)
+                        return
+                
+                if current_status in ["failed", "error", "uninstalling", "superseded"]:
+                    failure_count += 1
+                    consecutive_failures += 1
+                    
+                    logger.warning(f"Helm deployment {deployment_id} failed with status: {current_status} (failure #{failure_count})")
+                    
+                    # Check if we've exceeded maximum failures
+                    if failure_count >= max_failures:
+                        logger.error(f"Helm deployment {deployment_id} has failed {failure_count} times, exceeding maximum of {max_failures}")
+                        
+                        # Attempt to clean up the failed deployment
+                        try:
+                            await self.stop_helm_deployment(deployment_id)
+                            logger.info(f"Successfully cleaned up failed Helm deployment {deployment_id}")
+                        except Exception as cleanup_error:
+                            logger.error(f"Failed to clean up Helm deployment {deployment_id}: {cleanup_error}")
+                        
+                        # Update deployment status
+                        deployment.status = "failed"
+                        deployment.error_message = f"Deployment failed {failure_count} times, exceeding maximum failures ({max_failures})"
+                        deployment.updated_at = datetime.utcnow()
+                        self.deployments[deployment_id] = deployment
+                        await self._update_deployment_in_db(deployment)
+                        
+                        raise Exception(f"Helm deployment {deployment_id} failed {failure_count} times, exceeding maximum failures ({max_failures}). Deployment has been terminated.")
+                    
+                    # Wait longer before retrying after failure
+                    logger.info(f"Helm deployment {deployment_id} failed, waiting {failure_retry_delay} seconds before next check...")
+                    await asyncio.sleep(failure_retry_delay)
+                    continue
+                
+                # Reset consecutive failures if deployment is recovering
+                if current_status in ["pending-install", "pending-upgrade"] and last_status in ["failed", "error"]:
+                    consecutive_failures = 0
+                    logger.info(f"Helm deployment {deployment_id} is recovering from failure")
+                
+                last_status = current_status
+                
+                # Check timeout
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                if elapsed > timeout:
+                    logger.error(f"Timeout waiting for Helm deployment {deployment_id} to be ready after {elapsed}s (timeout: {timeout}s)")
+                    
+                    # Attempt to clean up the timed-out deployment
+                    try:
+                        await self.stop_helm_deployment(deployment_id)
+                        logger.info(f"Successfully cleaned up timed-out Helm deployment {deployment_id}")
+                    except Exception as cleanup_error:
+                        logger.error(f"Failed to clean up timed-out Helm deployment {deployment_id}: {cleanup_error}")
+                    
+                    # Update deployment status
+                    deployment.status = "failed"
+                    deployment.error_message = f"Timeout waiting for deployment to be ready (timeout: {timeout}s)"
+                    deployment.updated_at = datetime.utcnow()
+                    self.deployments[deployment_id] = deployment
+                    await self._update_deployment_in_db(deployment)
+                    
+                    raise Exception(f"Timeout waiting for Helm deployment {deployment_id} to be ready (timeout: {timeout}s). Deployment has been terminated.")
+                
+                # Normal polling interval
+                await asyncio.sleep(10)  # Check every 10 seconds
+                
+            except Exception as e:
+                if "failed" in str(e).lower() or "timeout" in str(e).lower() or "exceeding maximum failures" in str(e).lower():
+                    # These are expected failures, re-raise them
+                    raise
+                else:
+                    # Unexpected error, log and continue
+                    logger.warning(f"Unexpected error checking Helm deployment status: {e}")
+                    await asyncio.sleep(10)
+    
+    async def _check_helm_release_status(self, release_name: str, namespace: str) -> Dict[str, Any]:
+        """Check Helm release status"""
+        try:
+            helm_cmd = [
+                "helm", "status", release_name,
+                "--namespace", namespace,
+                "--output", "json"
+            ]
+            
+            result = subprocess.run(
+                helm_cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            import json
+            status_data = json.loads(result.stdout)
+            return {
+                'status': status_data.get('info', {}).get('status', 'unknown'),
+                'description': status_data.get('info', {}).get('description', ''),
+                'notes': status_data.get('info', {}).get('notes', '')
+            }
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to get Helm release status: {e.stderr}")
+            return {'status': 'error', 'description': f'Failed to get status: {e.stderr}'}
+        except Exception as e:
+            logger.error(f"Error checking Helm release status: {e}")
+            return {'status': 'unknown', 'description': str(e)}
+    
+    async def _check_pod_readiness(self, release_name: str, namespace: str) -> bool:
+        """Check if pods from Helm release are ready"""
+        try:
+            # Get pods with the release label
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=f"app.kubernetes.io/instance={release_name}"
+            )
+            
+            if not pods.items:
+                logger.warning(f"No pods found for Helm release {release_name}")
+                return False
+            
+            for pod in pods.items:
+                pod_name = pod.metadata.name
+                pod_status = pod.status.phase
+                
+                if pod_status != "Running":
+                    logger.debug(f"Pod {pod_name} status: {pod_status}")
+                    return False
+                
+                # Check container readiness
+                if pod.status.container_statuses:
+                    for container_status in pod.status.container_statuses:
+                        if not container_status.ready:
+                            logger.debug(f"Container {container_status.name} in pod {pod_name} not ready")
+                            return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking pod readiness for release {release_name}: {e}")
+            return False
 
 # Global instance
 vllm_manager = VLLMManager()
