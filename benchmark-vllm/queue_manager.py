@@ -594,6 +594,14 @@ class QueueManager:
                 # Check if VLLM creation should be skipped
                 skip_vllm_creation = queue_doc.get("skip_vllm_creation", False)
                 
+                # Debug logging to troubleshoot skip_vllm_creation flag
+                logger.info(f"🐛 DEBUG: skip_vllm_creation flag = {skip_vllm_creation} for request {request_id}")
+                logger.info(f"🐛 DEBUG: queue_doc keys = {list(queue_doc.keys())}")
+                if "skip_vllm_creation" in queue_doc:
+                    logger.info(f"🐛 DEBUG: queue_doc['skip_vllm_creation'] = {queue_doc['skip_vllm_creation']}")
+                else:
+                    logger.info(f"🐛 DEBUG: 'skip_vllm_creation' key not found in queue_doc")
+                
                 if skip_vllm_creation:
                     logger.info(f"Skipping VLLM creation for request {request_id} - using existing VLLM")
                     # Skip VLLM deployment and proceed to benchmark jobs

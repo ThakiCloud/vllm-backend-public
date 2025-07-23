@@ -1063,6 +1063,11 @@ class DeployerManager:
             # Check if VLLM creation should be skipped
             skip_vllm_creation = getattr(request, 'skip_vllm_creation', False)
             
+            # Debug logging
+            logger.info(f"🐛 DEBUG: skip_vllm_creation flag = {skip_vllm_creation} for request")
+            logger.info(f"🐛 DEBUG: request type = {type(request)}")
+            logger.info(f"🐛 DEBUG: hasattr(request, 'skip_vllm_creation') = {hasattr(request, 'skip_vllm_creation')}")
+            
             if skip_vllm_creation:
                 logger.info(f"VLLM creation is skipped - redirecting to queue deployment for benchmark jobs only")
                 
@@ -1134,7 +1139,7 @@ class DeployerManager:
                 logger.info("Helm deployment request registered in benchmark-vllm queue. Actual deployment will be handled by benchmark-vllm service.")
                 
                 return {
-                    "status": "success", 
+                    "status": "success",
                     "message": "VLLM Helm deployment request registered in queue successfully",
                     "deployment_id": "queued",
                     "queue_request_id": queue_request_id,
