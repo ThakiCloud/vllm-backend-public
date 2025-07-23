@@ -653,9 +653,17 @@ class VLLMManager:
                     continue
             
             # Wait a bit for resources to be fully deleted
-            await asyncio.sleep(5)
+            logger.info(f"⏳ Waiting for resources to be fully deleted...")
+            await asyncio.sleep(10)  # Initial wait
             
-            logger.info(f"Cleanup completed for release: {release_name}")
+            # Verify that resources are actually deleted
+            await self._verify_resources_deleted(release_name, namespace)
+            
+            # Final wait to ensure all background cleanup is complete
+            logger.info(f"⏳ Final wait to ensure all cleanup processes are complete...")
+            await asyncio.sleep(15)  # Additional safety wait
+            
+            logger.info(f"✅ Cleanup completed and verified for release: {release_name}")
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
@@ -663,7 +671,7 @@ class VLLMManager:
             pass
 
     async def _uninstall_helm_release(self, release_name: str, namespace: str):
-        """Uninstall existing Helm release"""
+        """Uninstall existing Helm release and wait for complete removal"""
         try:
             logger.info(f"Uninstalling Helm release: {release_name} from namespace: {namespace}")
             
@@ -676,7 +684,12 @@ class VLLMManager:
             )
             
             if result.returncode == 0:
-                logger.info(f"Successfully uninstalled Helm release: {release_name}")
+                logger.info(f"Helm uninstall command completed for release: {release_name}")
+                
+                # Wait for the release to be completely removed
+                await self._wait_for_helm_release_deletion(release_name, namespace)
+                
+                logger.info(f"✅ Successfully uninstalled and verified deletion of Helm release: {release_name}")
             else:
                 logger.warning(f"Failed to uninstall Helm release {release_name}: {result.stderr}")
                 
@@ -684,6 +697,50 @@ class VLLMManager:
             logger.warning(f"Error uninstalling Helm release {release_name}: {e}")
             # Don't fail if uninstall fails
 
+    async def _wait_for_helm_release_deletion(self, release_name: str, namespace: str, timeout: int = 60):
+        """Wait for Helm release to be completely deleted"""
+        logger.info(f"⏳ Waiting for Helm release {release_name} to be completely deleted...")
+        
+        start_time = datetime.utcnow()
+        
+        while True:
+            try:
+                # Check if release still exists
+                check_cmd = ["helm", "list", "-n", namespace, "-o", "json"]
+                result = subprocess.run(
+                    check_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                
+                if result.returncode == 0:
+                    try:
+                        releases = json.loads(result.stdout)
+                        release_exists = any(release.get("name") == release_name for release in releases)
+                        
+                        if not release_exists:
+                            logger.info(f"✅ Helm release {release_name} has been completely deleted")
+                            return
+                        else:
+                            logger.debug(f"Helm release {release_name} still exists, waiting...")
+                            
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse helm list output during deletion check")
+                
+                # Check timeout
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                if elapsed > timeout:
+                    logger.warning(f"⏰ Timeout waiting for Helm release {release_name} deletion after {timeout}s")
+                    return  # Don't fail, just proceed
+                
+                # Wait before next check
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                logger.warning(f"Error checking Helm release deletion: {e}")
+                await asyncio.sleep(3)
+    
     async def _helm_install(self, release_name: str, chart_path: str, namespace: str, values_file: str):
         """Execute Helm install command asynchronously (non-blocking)"""
         try:
@@ -1098,6 +1155,83 @@ class VLLMManager:
             return False
         except Exception as e:
             logger.warning(f"⚠️ Error checking deployment reusability: {e}")
+            return False
+
+    async def _verify_resources_deleted(self, release_name: str, namespace: str):
+        """Verify that all resources associated with the Helm release are deleted."""
+        try:
+            logger.info(f"Verifying resources for release: {release_name} in namespace: {namespace} are deleted.")
+            
+            # List all resources in the namespace
+            list_cmd = ["kubectl", "get", "all", "-n", namespace, "-o", "json"]
+            result = subprocess.run(
+                list_cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode != 0:
+                logger.info(f"Could not list resources in namespace {namespace}: {result.stderr}")
+                return False
+            
+            resources = json.loads(result.stdout)
+            
+            # Filter for resources associated with the release
+            release_resources = []
+            for item in resources.get('items', []):
+                if item['metadata'].get('labels', {}).get('app.kubernetes.io/instance') == release_name:
+                    release_resources.append(item['kind'])
+            
+            if not release_resources:
+                logger.info(f"No resources found for release {release_name} in namespace {namespace}.")
+                return True
+            
+            logger.warning(f"Found {len(release_resources)} resources for release {release_name} that might still exist: {', '.join(release_resources)}")
+            
+            # Attempt to delete each resource individually
+            for resource_kind in release_resources:
+                try:
+                    delete_cmd = ["kubectl", "delete", resource_kind, f"-l", f"app.kubernetes.io/instance={release_name}", "-n", namespace, "--ignore-not-found=true"]
+                    subprocess.run(delete_cmd, capture_output=True, text=True, check=False)
+                    logger.info(f"Attempted to delete {resource_kind} for release {release_name}")
+                except Exception as delete_error:
+                    logger.warning(f"Failed to delete {resource_kind} for release {release_name}: {delete_error}")
+                    continue
+            
+            # Wait a bit for resources to be fully deleted
+            logger.info(f"⏳ Waiting for resources to be fully deleted after individual deletion attempts...")
+            await asyncio.sleep(10)
+            
+            # List resources again to confirm deletion
+            result = subprocess.run(
+                list_cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode != 0:
+                logger.info(f"Could not list resources in namespace {namespace} after individual deletion attempts: {result.stderr}")
+                return False
+            
+            resources_after_individual_delete = json.loads(result.stdout)
+            
+            # Filter for resources associated with the release
+            remaining_release_resources = []
+            for item in resources_after_individual_delete.get('items', []):
+                if item['metadata'].get('labels', {}).get('app.kubernetes.io/instance') == release_name:
+                    remaining_release_resources.append(item['kind'])
+            
+            if remaining_release_resources:
+                logger.warning(f"Still found {len(remaining_release_resources)} resources for release {release_name} that might still exist: {', '.join(remaining_release_resources)}")
+                return False
+            
+            logger.info(f"✅ All resources for release {release_name} in namespace {namespace} are now deleted.")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error verifying resource deletion: {e}")
             return False
 
 # Global instance

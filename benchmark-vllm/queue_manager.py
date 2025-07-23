@@ -741,16 +741,28 @@ class QueueManager:
                     queue_doc["current_step"] = "benchmark_jobs"
                     await self._update_queue_request_in_db(request_id, queue_doc)
                     
-                    created_jobs = await self._execute_benchmark_jobs(
-                        queue_doc["benchmark_configs"],
-                        queue_doc["deployment_id"],  # Use deployment_id from queue_doc instead
-                        request_id  # Pass queue_request_id for job tracking
-                    )
-                    logger.info(f"Completed all benchmark jobs for request {request_id}")
+                    try:
+                        created_jobs = await self._execute_benchmark_jobs(
+                            queue_doc["benchmark_configs"],
+                            queue_doc["deployment_id"],  # Use deployment_id from queue_doc instead
+                            request_id  # Pass queue_request_id for job tracking
+                        )
+                        
+                        # Check if any jobs failed
+                        failed_jobs = [job for job in created_jobs if job.get('failed', False)]
+                        if failed_jobs:
+                            failed_job_names = [job['name'] for job in failed_jobs]
+                            raise Exception(f"Benchmark jobs failed: {', '.join(failed_job_names)}")
+                        
+                        logger.info(f"✅ All {len(created_jobs)} benchmark jobs completed successfully for request {request_id}")
+                        
+                    except Exception as benchmark_error:
+                        logger.error(f"❌ Benchmark jobs failed for request {request_id}: {benchmark_error}")
+                        raise Exception(f"Benchmark execution failed: {benchmark_error}")
                 else:
                     logger.info(f"No benchmark jobs configured for request {request_id}")
                 
-                # Update status to completed
+                # Update status to completed ONLY if we reach here (no exceptions)
                 queue_doc["status"] = "completed"
                 queue_doc["completed_at"] = datetime.utcnow()
                 queue_doc["current_step"] = "completed"
@@ -758,7 +770,9 @@ class QueueManager:
                 if skip_vllm_creation:
                     logger.info(f"🚨 [BENCHMARK-VLLM] ✅ Successfully processed queue request {request_id} (VLLM creation skipped)")
                 else:
-                    logger.info(f"Successfully processed regular queue request {request_id}")
+                    logger.info(f"✅ Successfully processed regular queue request {request_id}")
+                
+                logger.info(f"🎉 Queue request {request_id} marked as COMPLETED")
                 
             except Exception as e:
                 # Update status to failed
@@ -873,12 +887,12 @@ class QueueManager:
 
     async def _execute_benchmark_jobs(self, benchmark_configs: List[Dict[str, Any]], deployment_id: str, queue_request_id: str = None):
         """Execute benchmark jobs sequentially via Benchmark Deployer service and track created jobs"""
-        logger.info(f"Executing {len(benchmark_configs)} benchmark jobs for deployment {deployment_id}")
+        logger.info(f"🚀 Starting execution of {len(benchmark_configs)} benchmark jobs for deployment {deployment_id}")
         
         if not benchmark_configs:
             logger.info("No benchmark jobs to execute")
             return []
-        
+
         # Benchmark Deployer service URL - environment-aware configuration
         import os
         if os.getenv("KUBERNETES_SERVICE_HOST") or os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount"):
@@ -892,16 +906,22 @@ class QueueManager:
         
         # Track created job names for cleanup purposes
         created_job_names = []
+        successful_jobs = 0
+        failed_jobs = 0
         
         for i, config in enumerate(benchmark_configs):
             job_name = config.get('name', f'benchmark-job-{i+1}')
             yaml_content = config.get('yaml_content', '')
             namespace = config.get('namespace', 'default')
             
-            logger.info(f"Executing benchmark job {i+1}/{len(benchmark_configs)}: {job_name}")
+            logger.info(f"🔧 Executing benchmark job {i+1}/{len(benchmark_configs)}: {job_name} in namespace {namespace}")
+            logger.debug(f"Job YAML content preview: {yaml_content[:200]}..." if len(yaml_content) > 200 else f"Job YAML content: {yaml_content}")
+            
+            job_start_time = datetime.utcnow()
             
             try:
                 # Call Benchmark Deployer API to deploy the job
+                logger.info(f"📤 Deploying job {job_name} to deployer service...")
                 deployment_result = await self._deploy_benchmark_job_to_deployer(
                     yaml_content=yaml_content,
                     namespace=namespace,
@@ -911,6 +931,7 @@ class QueueManager:
                 
                 # Get the actual resource name from deployment response
                 actual_job_name = deployment_result.get('actual_resource_name', job_name)
+                logger.info(f"✅ Job {job_name} deployed successfully as {actual_job_name}")
                 
                 # Store the created job information for later cleanup
                 job_info = {
@@ -925,6 +946,9 @@ class QueueManager:
                     await self._update_queue_request_job_names(queue_request_id, created_job_names)
                 
                 # Wait for the job to complete before starting the next one
+                logger.info(f"⏳ Waiting for job {actual_job_name} to complete...")
+                wait_start_time = datetime.utcnow()
+                
                 await self._wait_for_job_completion(
                     job_name=actual_job_name,
                     namespace=namespace,
@@ -933,10 +957,19 @@ class QueueManager:
                     max_failures=JOB_MAX_FAILURES
                 )
                 
-                logger.info(f"Benchmark job {actual_job_name} completed successfully")
+                wait_duration = (datetime.utcnow() - wait_start_time).total_seconds()
+                job_total_duration = (datetime.utcnow() - job_start_time).total_seconds()
+                
+                logger.info(f"✅ Benchmark job {actual_job_name} completed successfully!")
+                logger.info(f"📊 Job timing - Wait: {wait_duration:.1f}s, Total: {job_total_duration:.1f}s")
+                successful_jobs += 1
                 
             except Exception as e:
-                logger.error(f"Failed to execute benchmark job {job_name}: {e}")
+                failed_jobs += 1
+                job_duration = (datetime.utcnow() - job_start_time).total_seconds()
+                
+                logger.error(f"❌ Failed to execute benchmark job {job_name}: {e}")
+                logger.error(f"⏱️ Job failed after {job_duration:.1f}s")
                 
                 # Even if job failed to complete, if it was created, we should track it for cleanup
                 if 'actual_job_name' in locals() and actual_job_name:
@@ -951,9 +984,17 @@ class QueueManager:
                         await self._update_queue_request_job_names(queue_request_id, created_job_names)
                 
                 # Continue with next job even if current one fails
+                logger.warning(f"⏭️ Continuing with next job despite failure of {job_name}")
                 continue
         
-        logger.info(f"Completed execution of {len(benchmark_configs)} benchmark jobs. Created {len(created_job_names)} jobs.")
+        total_duration = sum((job.get('duration', 0) for job in created_job_names), 0)
+        
+        logger.info(f"🏁 Completed execution of {len(benchmark_configs)} benchmark jobs")
+        logger.info(f"📈 Results: {successful_jobs} successful, {failed_jobs} failed, {len(created_job_names)} total created")
+        
+        if failed_jobs > 0:
+            logger.warning(f"⚠️ {failed_jobs} jobs failed but queue processing will continue")
+        
         return created_job_names
 
     async def _deploy_benchmark_job_to_deployer(self, yaml_content: str, namespace: str, job_name: str, deployer_base_url: str):
@@ -1013,8 +1054,30 @@ class QueueManager:
                             logger.debug(f"Job {job_name} status: {job_status} (check #{check_count})")
                             
                             if job_status in ['succeeded', 'completed']:
-                                logger.info(f"✅ Job {job_name} completed successfully")
-                                return
+                                logger.info(f"✅ Job {job_name} reported as {job_status}")
+                                
+                                # Double-check by verifying job completion one more time
+                                await asyncio.sleep(5)  # Wait a bit to ensure job is truly completed
+                                
+                                # Final verification
+                                async with aiohttp.ClientSession() as verify_session:
+                                    async with verify_session.get(status_url, params=params) as verify_response:
+                                        if verify_response.status == 200:
+                                            verify_data = await verify_response.json()
+                                            final_status = verify_data.get("status", "unknown").lower()
+                                            if final_status in ['succeeded', 'completed']:
+                                                logger.info(f"✅ Job {job_name} completion VERIFIED - final status: {final_status}")
+                                                return
+                                            else:
+                                                logger.warning(f"⚠️ Job {job_name} status changed during verification: {job_status} -> {final_status}")
+                                                # Don't return, continue monitoring
+                                        elif verify_response.status == 404:
+                                            logger.info(f"✅ Job {job_name} completed and was cleaned up during verification")
+                                            return
+                                        else:
+                                            logger.warning(f"⚠️ Could not verify job {job_name} completion: HTTP {verify_response.status}")
+                                            # Assume it completed since it was reported as succeeded
+                                            return
                             
                             if job_status in ['failed', 'error']:
                                 failure_count += 1
@@ -1049,15 +1112,35 @@ class QueueManager:
                         
                         elif response.status == 404:
                             not_found_count += 1
-                            logger.info(f"Job {job_name} not found (attempt {not_found_count}/3), might be completed and cleaned up by ttlSecondsAfterFinished")
+                            logger.warning(f"Job {job_name} not found (attempt {not_found_count}/5), checking if it was deleted or never created")
                             
-                            # If job is not found multiple times consecutively, assume it completed and was cleaned up
-                            if not_found_count >= 3:
-                                logger.info(f"✅ Job {job_name} not found for {not_found_count} consecutive checks - assuming completed and auto-cleaned")
-                                return
+                            # If job is not found multiple times consecutively, check more carefully
+                            if not_found_count >= 5:
+                                # Before assuming completion, try to verify if job ever existed or completed
+                                logger.warning(f"❌ Job {job_name} not found for {not_found_count} consecutive checks")
+                                
+                                # Check if there are any pods with this job name that completed
+                                try:
+                                    pod_status = await self._check_job_pods_status(job_name, namespace)
+                                    if pod_status == "completed":
+                                        logger.info(f"✅ Job {job_name} pods show completed status - job finished and was cleaned up")
+                                        return
+                                    elif pod_status == "not_found":
+                                        logger.error(f"❌ Job {job_name} and its pods not found - job may have never been created or failed to start")
+                                        raise Exception(f"Job {job_name} not found and no evidence of completion")
+                                    else:
+                                        logger.warning(f"⚠️ Job {job_name} pods status: {pod_status}")
+                                except Exception as pod_check_error:
+                                    logger.error(f"Failed to check pod status for job {job_name}: {pod_check_error}")
+                                
+                                # If we can't verify completion, treat as error
+                                raise Exception(f"Job {job_name} disappeared without clear completion evidence")
                         
                         else:
                             logger.warning(f"Failed to get status for job {job_name}: HTTP {response.status}")
+                            # Don't immediately fail, but log the issue
+                            if response.status >= 500:
+                                logger.warning(f"Server error ({response.status}) checking job {job_name}, will retry")
                 
             except Exception as e:
                 # Don't count connection/API errors as job failures
@@ -1259,6 +1342,45 @@ class QueueManager:
         except Exception as e:
             logger.error(f"Error getting current VLLM model: {e}")
             return None
+
+    async def _check_job_pods_status(self, job_name: str, namespace: str) -> str:
+        """Check the status of pods associated with a job."""
+        try:
+            from kubernetes import client, config
+            
+            # Load Kubernetes config
+            try:
+                config.load_incluster_config()  # For in-cluster
+            except:
+                try:
+                    config.load_kube_config()  # For local development
+                except Exception as e:
+                    logger.warning(f"Could not load Kubernetes config for pod status check: {e}")
+                    return "error"
+            
+            v1 = client.CoreV1Api()
+            
+            # List pods in the namespace
+            pods = v1.list_namespaced_pod(namespace=namespace)
+            
+            for pod in pods.items:
+                # Check if the pod is associated with the job
+                if pod.metadata.owner_references and pod.metadata.owner_references[0].name == job_name:
+                    # Check the pod's status
+                    if pod.status.phase == "Succeeded":
+                        return "completed"
+                    elif pod.status.phase == "Failed":
+                        return "failed"
+                    elif pod.status.phase == "Pending":
+                        return "pending"
+                    elif pod.status.phase == "Running":
+                        return "running"
+                    else:
+                        return pod.status.phase
+            return "not_found" # Job not found or no pods found
+        except Exception as e:
+            logger.error(f"Error checking pod status for job {job_name}: {e}")
+            return "error"
 
 # Global queue manager instance
 queue_manager = QueueManager(
