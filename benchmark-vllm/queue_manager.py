@@ -1200,11 +1200,25 @@ class QueueManager:
             raise e
 
     async def _save_queue_request_to_db(self, queue_doc: Dict[str, Any]):
-        """Save queue request to database"""
+        """Save or update queue request to database using upsert"""
         try:
             db = get_database()
             collection = db.vllm_deployment_queue
-            await collection.insert_one(queue_doc)
+            
+            # Use upsert to avoid duplicate key errors
+            queue_request_id = queue_doc.get("queue_request_id")
+            if queue_request_id:
+                await collection.update_one(
+                    {"queue_request_id": queue_request_id},
+                    {"$set": queue_doc},
+                    upsert=True
+                )
+                logger.debug(f"Upserted queue request {queue_request_id} to database")
+            else:
+                # Fallback to insert if no queue_request_id
+                await collection.insert_one(queue_doc)
+                logger.debug(f"Inserted new queue request to database")
+                
         except Exception as e:
             logger.error(f"Failed to save queue request to database: {e}")
 
