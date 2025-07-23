@@ -432,8 +432,16 @@ class DeployerManager:
             
             queue_request_id = str(uuid.uuid4())
             
+            # Debug logging for skip_vllm_creation flag
+            logger.info(f"🚨 [DEPLOYER-QUEUE] =================================================")
+            logger.info(f"🚨 [DEPLOYER-QUEUE] Adding request to queue: {queue_request_id}")
+            logger.info(f"🚨 [DEPLOYER-QUEUE] request.skip_vllm_creation = {request.skip_vllm_creation}")
+            logger.info(f"🚨 [DEPLOYER-QUEUE] request.__dict__ = {request.__dict__}")
+            
             # Calculate total steps: VLLM 생성을 건너뛰면 0, 아니면 1 + 벤치마크 작업 수
             total_steps = (0 if request.skip_vllm_creation else 1) + len(request.benchmark_configs)
+            
+            logger.info(f"🚨 [DEPLOYER-QUEUE] total_steps calculated = {total_steps} (VLLM skipped: {request.skip_vllm_creation})")
             
             # Create queue request document
             queue_doc = {
@@ -454,6 +462,9 @@ class DeployerManager:
                 "completed_steps": 0,
                 "error_message": None
             }
+            
+            logger.info(f"🚨 [DEPLOYER-QUEUE] queue_doc['skip_vllm_creation'] = {queue_doc['skip_vllm_creation']}")
+            logger.info(f"🚨 [DEPLOYER-QUEUE] =================================================")
             
             # Store in database
             await self._save_vllm_queue_request_to_db(queue_doc)
@@ -1064,12 +1075,16 @@ class DeployerManager:
             skip_vllm_creation = getattr(request, 'skip_vllm_creation', False)
             
             # Debug logging
-            logger.info(f"🐛 DEBUG: skip_vllm_creation flag = {skip_vllm_creation} for request")
-            logger.info(f"🐛 DEBUG: request type = {type(request)}")
-            logger.info(f"🐛 DEBUG: hasattr(request, 'skip_vllm_creation') = {hasattr(request, 'skip_vllm_creation')}")
+            logger.info(f"🚨 [DEPLOYER] =================================================")
+            logger.info(f"🚨 [DEPLOYER] VLLM Helm Deployment Request Received")
+            logger.info(f"🚨 [DEPLOYER] skip_vllm_creation flag = {skip_vllm_creation}")
+            logger.info(f"🚨 [DEPLOYER] request type = {type(request)}")
+            logger.info(f"🚨 [DEPLOYER] hasattr(request, 'skip_vllm_creation') = {hasattr(request, 'skip_vllm_creation')}")
+            logger.info(f"🚨 [DEPLOYER] request.__dict__ = {request.__dict__}")
+            logger.info(f"🚨 [DEPLOYER] =================================================")
             
             if skip_vllm_creation:
-                logger.info(f"VLLM creation is skipped - redirecting to queue deployment for benchmark jobs only")
+                logger.info(f"🚨 [DEPLOYER] ✅ VLLM creation is SKIPPED - redirecting to queue for benchmark jobs only")
                 
                 # Convert to queue request and process via queue
                 from models import VLLMDeploymentQueueRequest
@@ -1081,8 +1096,13 @@ class DeployerManager:
                     skip_vllm_creation=True
                 )
                 
+                logger.info(f"🚨 [DEPLOYER] ✅ Created queue_request with skip_vllm_creation=True")
+                logger.info(f"🚨 [DEPLOYER] ✅ queue_request.skip_vllm_creation = {queue_request.skip_vllm_creation}")
+                
                 # Add to queue instead of deploying
                 queue_response = await self.add_vllm_to_queue(queue_request)
+                
+                logger.info(f"🚨 [DEPLOYER] ✅ Added to queue with ID: {queue_response.queue_request_id}")
                 
                 return {
                     "status": "success",
@@ -1092,6 +1112,7 @@ class DeployerManager:
                     "action": "queued"
                 }
             
+            logger.info(f"🚨 [DEPLOYER] ❌ VLLM creation is NOT SKIPPED - proceeding with Helm deployment")
             logger.info(f"Starting VLLM Helm deployment: {request.vllm_helm_config.release_name}")
             
             # Get GitHub token first for queue registration

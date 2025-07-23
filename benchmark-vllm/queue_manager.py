@@ -595,19 +595,25 @@ class QueueManager:
                 skip_vllm_creation = queue_doc.get("skip_vllm_creation", False)
                 
                 # Debug logging to troubleshoot skip_vllm_creation flag
-                logger.info(f"🐛 DEBUG: skip_vllm_creation flag = {skip_vllm_creation} for request {request_id}")
-                logger.info(f"🐛 DEBUG: queue_doc keys = {list(queue_doc.keys())}")
+                logger.info(f"🚨 [BENCHMARK-VLLM] =================================================")
+                logger.info(f"🚨 [BENCHMARK-VLLM] Processing queue request: {request_id}")
+                logger.info(f"🚨 [BENCHMARK-VLLM] skip_vllm_creation flag = {skip_vllm_creation}")
+                logger.info(f"🚨 [BENCHMARK-VLLM] queue_doc keys = {list(queue_doc.keys())}")
+                logger.info(f"🚨 [BENCHMARK-VLLM] queue_doc type = {type(queue_doc)}")
                 if "skip_vllm_creation" in queue_doc:
-                    logger.info(f"🐛 DEBUG: queue_doc['skip_vllm_creation'] = {queue_doc['skip_vllm_creation']}")
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ✅ queue_doc['skip_vllm_creation'] = {queue_doc['skip_vllm_creation']} (type: {type(queue_doc['skip_vllm_creation'])})")
                 else:
-                    logger.info(f"🐛 DEBUG: 'skip_vllm_creation' key not found in queue_doc")
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ❌ 'skip_vllm_creation' key NOT FOUND in queue_doc")
+                logger.info(f"🚨 [BENCHMARK-VLLM] =================================================")
                 
                 if skip_vllm_creation:
-                    logger.info(f"Skipping VLLM creation for request {request_id} - using existing VLLM")
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ✅ SKIPPING VLLM creation for request {request_id} - using existing VLLM")
                     # Skip VLLM deployment and proceed to benchmark jobs
                     queue_doc["deployment_id"] = "existing-vllm"
                     queue_doc["current_step"] = "benchmark_jobs"
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ✅ Set deployment_id='existing-vllm', current_step='benchmark_jobs'")
                 else:
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ❌ NOT SKIPPING VLLM creation - proceeding with deployment for request {request_id}")
                     # Regular VLLM deployment
                     logger.info(f"Processing VLLM deployment queue request {request_id}")
                     

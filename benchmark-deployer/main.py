@@ -290,6 +290,12 @@ async def add_vllm_to_queue(request: VLLMDeploymentQueueRequest):
 async def deploy_vllm_with_helm(request: VLLMHelmDeploymentRequest):
     """Deploy VLLM using Helm with custom values from project repository"""
     try:
+        # Debug logging for skip_vllm_creation flag
+        logger.info(f"🚨 [FRONTEND→DEPLOYER] Received Helm deployment request")
+        logger.info(f"🚨 [FRONTEND→DEPLOYER] skip_vllm_creation = {getattr(request, 'skip_vllm_creation', 'NOT_FOUND')}")
+        logger.info(f"🚨 [FRONTEND→DEPLOYER] request.dict() = {request.dict()}")
+        logger.info(f"🚨 [FRONTEND→DEPLOYER] hasattr(request, 'skip_vllm_creation') = {hasattr(request, 'skip_vllm_creation')}")
+        
         response = await deployer_manager.deploy_vllm_with_helm(request)
         return response
     except Exception as e:
