@@ -32,9 +32,9 @@ from models import (
     TerminalSessionRequest, TerminalSessionResponse, TerminalSessionInfo, TerminalSessionListResponse,
     VLLMHelmDeploymentRequest, VLLMHelmConfig
 )
-from kubernetes_client import k8s_client
-from terminal_manager import terminal_manager
-from database import connect_to_mongo, get_deployments_collection
+from kubernetes_client import KubernetesClient
+from terminal_manager import TerminalManager
+from database import connect_to_mongo, get_deployments_collection, get_database
 
 # Configure logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
@@ -42,48 +42,106 @@ logger = logging.getLogger(__name__)
 
 class DeployerManager:
     def __init__(self):
-        self.mongo_client = None
         self.db = None
-        self.processing_queue = False  # 큐 처리 중인지 확인하는 플래그
-
+        self.k8s_client = KubernetesClient()
+        self.terminal_manager = TerminalManager()
+        
     async def initialize(self):
         """Initialize the deployer manager."""
+        logger.info("Initializing DeployerManager...")
+        
+        # Initialize MongoDB connection
+        self.db = await get_database()
+        logger.info("MongoDB connection established")
+        
+        # Initialize Kubernetes client
+        await self.k8s_client.initialize()
+        logger.info("Kubernetes client initialized")
+        
+        # Initialize terminal manager
+        await self.terminal_manager.initialize(self.k8s_client)
+        logger.info("Terminal manager initialized")
+        
+        logger.info("DeployerManager initialized successfully")
+
+    async def _get_vllm_model_from_benchmark_configs(self, benchmark_configs: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        벤치마크 설정에서 VLLM endpoint 정보를 추출하여 모델명을 가져옵니다.
+        YAML 내용에서 서비스명이나 URL을 분석하여 사용할 VLLM 모델을 결정합니다.
+        """
         try:
-            # Initialize MongoDB connection
-            await connect_to_mongo()
-            logger.info("MongoDB connection initialized")
+            import re
             
-            # Initialize our own MongoDB connection for queue operations
-            from config import MONGO_URL, DB_NAME
-            import motor.motor_asyncio
-            self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
-                MONGO_URL,
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=5000
-            )
-            self.db = self.mongo_client[DB_NAME]
-            logger.info("DeployerManager MongoDB connection initialized")
+            for config in benchmark_configs:
+                yaml_content = config.get("yaml_content", "")
+                if not yaml_content:
+                    continue
+                
+                logger.debug(f"Analyzing benchmark config: {config.get('name', 'unnamed')}")
+                
+                # 1. VLLM_SERVICE_NAME 플레이스홀더 대신 실제 서비스명 찾기
+                # 패턴: service_name: vllm-qwen2-05b-service 또는 url: http://vllm-qwen2-05b:8000
+                service_patterns = [
+                    r'(?:service|url|endpoint|host):\s*["\']?(?:https?://)?([a-zA-Z0-9-]+(?:-service)?)["\']?',
+                    r'VLLM_SERVICE_NAME["\']?\s*:\s*["\']?([a-zA-Z0-9-]+)["\']?',
+                    r'vllm-([a-zA-Z0-9-]+)(?:-service)?',
+                    r'http://([a-zA-Z0-9-]+)(?::8000)?'
+                ]
+                
+                for pattern in service_patterns:
+                    matches = re.findall(pattern, yaml_content, re.IGNORECASE)
+                    for match in matches:
+                        service_name = match.strip()
+                        
+                        # vllm-{model} 패턴에서 모델명 추출
+                        if service_name.startswith("vllm-"):
+                            model_part = service_name[5:]  # "vllm-" 제거
+                            # -service suffix 제거
+                            if model_part.endswith("-service"):
+                                model_part = model_part[:-8]
+                            
+                            if model_part:  # 빈 문자열이 아닌 경우
+                                logger.info(f"Found VLLM model from benchmark config endpoint: {model_part}")
+                                return model_part
+                
+                # 2. 환경 변수나 args에서 모델명 직접 찾기
+                model_patterns = [
+                    r'MODEL_NAME["\']?\s*:\s*["\']?([^"\'\s]+)["\']?',
+                    r'--model["\']?\s*["\']?([^"\'\s]+)["\']?',
+                    r'model["\']?\s*:\s*["\']?([^"\'\s]+)["\']?'
+                ]
+                
+                for pattern in model_patterns:
+                    matches = re.findall(pattern, yaml_content, re.IGNORECASE)
+                    for match in matches:
+                        model_name = match.strip()
+                        # 모델 경로에서 모델명만 추출 (예: microsoft/DialoGPT-medium -> DialoGPT-medium)
+                        if "/" in model_name:
+                            model_name = model_name.split("/")[-1]
+                        
+                        if model_name and not model_name.startswith("VLLM_"):  # 플레이스홀더가 아닌 경우
+                            logger.info(f"Found VLLM model from benchmark config model spec: {model_name}")
+                            return model_name
             
-            # Initialize Kubernetes client
-            await k8s_client.initialize()
-            logger.info("Deployer manager initialized with Kubernetes connection")
+            logger.info("No VLLM model found in benchmark configurations")
+            return None
+            
         except Exception as e:
-            logger.error(f"Failed to initialize Kubernetes client: {e}")
-            # Re-raise the exception to prevent the service from starting without Kubernetes
-            raise Exception(f"Failed to initialize deployer manager: Kubernetes client initialization failed: {str(e)}")
+            logger.error(f"Error extracting VLLM model from benchmark configs: {e}")
+            return None
 
     async def deploy_yaml(self, request: DeploymentRequest) -> DeploymentResponse:
         """Deploy YAML content to Kubernetes."""
         try:
             # Check if Kubernetes client is connected
-            if not k8s_client.is_connected:
+            if not self.k8s_client.is_connected:
                 logger.error("Kubernetes client is not connected. Attempting to reconnect...")
-                await k8s_client.initialize()
+                await self.k8s_client.initialize()
                 
             namespace = request.namespace or DEFAULT_NAMESPACE
             
             # Parse and deploy YAML using Kubernetes client
-            result = await k8s_client.deploy_yaml(
+            result = await self.k8s_client.deploy_yaml(
                 yaml_content=request.yaml_content,
                 namespace=namespace
             )
@@ -127,7 +185,7 @@ class DeployerManager:
             namespace = request.namespace or DEFAULT_NAMESPACE
             
             # Delete resources using Kubernetes client
-            result = await k8s_client.delete_yaml(
+            result = await self.k8s_client.delete_yaml(
                 yaml_content=request.yaml_content,
                 namespace=namespace
             )
@@ -163,7 +221,7 @@ class DeployerManager:
             namespace = request.namespace or DEFAULT_NAMESPACE
             
             # Get logs using Kubernetes client
-            logs = await k8s_client.get_job_logs(
+            logs = await self.k8s_client.get_job_logs(
                 job_name=request.job_name,
                 namespace=namespace,
                 tail_lines=request.tail_lines,
@@ -186,7 +244,7 @@ class DeployerManager:
     async def get_job_status(self, job_name: str, namespace: str = DEFAULT_NAMESPACE) -> JobStatusResponse:
         """Get job status."""
         try:
-            status = await k8s_client.get_job_status(job_name=job_name, namespace=namespace)
+            status = await self.k8s_client.get_job_status(job_name=job_name, namespace=namespace)
             
             logger.info(f"Retrieved status for job '{job_name}': {status.status}")
             
@@ -229,7 +287,7 @@ class DeployerManager:
                         current_status = None
                         
                         if doc["resource_type"] == "job":
-                            status_response = await k8s_client.get_job_status(
+                            status_response = await self.k8s_client.get_job_status(
                                 job_name=doc["resource_name"],
                                 namespace=doc["namespace"]
                             )
@@ -239,13 +297,13 @@ class DeployerManager:
                             deployment["failed_pods"] = status_response.failed_pods
                             
                         elif doc["resource_type"] == "deployment":
-                            current_status = await k8s_client.get_deployment_status(
+                            current_status = await self.k8s_client.get_deployment_status(
                                 deployment_name=doc["resource_name"],
                                 namespace=doc["namespace"]
                             )
                             
                         elif doc["resource_type"] == "service":
-                            current_status = await k8s_client.get_service_status(
+                            current_status = await self.k8s_client.get_service_status(
                                 service_name=doc["resource_name"],
                                 namespace=doc["namespace"]
                             )
@@ -288,7 +346,7 @@ class DeployerManager:
     async def get_system_health(self) -> Dict[str, Any]:
         """Get system health information."""
         try:
-            k8s_health = await k8s_client.get_cluster_info()
+            k8s_health = await self.k8s_client.get_cluster_info()
             
             # Get active deployments count
             deployments_collection = get_deployments_collection()
@@ -319,14 +377,14 @@ class DeployerManager:
             namespace = request.namespace or DEFAULT_NAMESPACE
             
             # Get pod information first
-            pod_info = await k8s_client.get_job_pod_for_terminal(
+            pod_info = await self.k8s_client.get_job_pod_for_terminal(
                 job_name=request.job_name,
                 namespace=namespace,
                 pod_name=request.pod_name
             )
             
             # Create terminal session
-            session_id = await terminal_manager.create_session(
+            session_id = await self.terminal_manager.create_session(
                 job_name=request.job_name,
                 namespace=namespace,
                 pod_name=pod_info["pod_name"],
@@ -356,7 +414,7 @@ class DeployerManager:
     async def get_terminal_session(self, session_id: str) -> Optional[TerminalSessionInfo]:
         """Get terminal session information."""
         try:
-            session = terminal_manager.get_session_info(session_id)
+            session = self.terminal_manager.get_session_info(session_id)
             
             if session:
                 logger.info(f"Retrieved terminal session info for {session_id}")
@@ -371,7 +429,7 @@ class DeployerManager:
     async def list_terminal_sessions(self, job_name: Optional[str] = None) -> TerminalSessionListResponse:
         """List terminal sessions."""
         try:
-            sessions_data = terminal_manager.list_sessions(job_name)
+            sessions_data = self.terminal_manager.list_sessions(job_name)
             
             sessions = [TerminalSessionInfo(**session) for session in sessions_data["sessions"]]
             
@@ -390,7 +448,7 @@ class DeployerManager:
     async def stop_terminal_session(self, session_id: str):
         """Stop a terminal session."""
         try:
-            await terminal_manager.stop_session(session_id)
+            await self.terminal_manager.stop_session(session_id)
             
             logger.info(f"Stopped terminal session {session_id}")
             
@@ -401,7 +459,7 @@ class DeployerManager:
     async def stop_job_terminal_sessions(self, job_name: str):
         """Stop all terminal sessions for a job."""
         try:
-            stopped_count = await terminal_manager.stop_job_sessions(job_name)
+            stopped_count = await self.terminal_manager.stop_job_sessions(job_name)
             
             logger.info(f"Stopped {stopped_count} terminal sessions for job '{job_name}'")
             
@@ -412,7 +470,7 @@ class DeployerManager:
     async def cleanup_inactive_terminal_sessions(self, timeout_minutes: int = 30):
         """Clean up inactive terminal sessions."""
         try:
-            cleaned_count = await terminal_manager.cleanup_inactive_sessions(timeout_minutes)
+            cleaned_count = await self.terminal_manager.cleanup_inactive_sessions(timeout_minutes)
             
             if cleaned_count > 0:
                 logger.info(f"Cleaned up {cleaned_count} inactive terminal sessions")
@@ -713,7 +771,8 @@ class DeployerManager:
         """Clean up VLLM deployment if it was created by this request"""
         try:
             vllm_deployment_id = queue_request.get("vllm_deployment_id")
-            if vllm_deployment_id and vllm_deployment_id != "existing-vllm":
+            # Skip cleanup for all existing VLLM variants
+            if vllm_deployment_id and not vllm_deployment_id.startswith("existing-vllm"):
                 logger.info(f"Cleaning up VLLM deployment {vllm_deployment_id}")
                 
                 # Check if other requests are using this deployment
@@ -743,13 +802,11 @@ class DeployerManager:
                         logger.warning(f"Error deleting VLLM deployment {vllm_deployment_id}: {e}")
                 else:
                     logger.info(f"VLLM deployment {vllm_deployment_id} is used by {len(other_requests)} other requests, not deleting")
-            else:
-                logger.info(f"No VLLM deployment to clean up for request {queue_request_id} (deployment_id: {vllm_deployment_id})")
-            
-            logger.info(f"Completed VLLM cleanup for request {queue_request_id}")
+            elif vllm_deployment_id and vllm_deployment_id.startswith("existing-vllm"):
+                logger.info(f"Skipping cleanup for existing VLLM: {vllm_deployment_id}")
             
         except Exception as e:
-            logger.error(f"Error during VLLM deployment cleanup for request {queue_request_id}: {e}")
+            logger.warning(f"Error during VLLM deployment cleanup: {e}")
 
     async def change_vllm_queue_priority(self, queue_request_id: str, new_priority: str) -> bool:
         """Change priority of a VLLM queue request"""
@@ -863,8 +920,20 @@ class DeployerManager:
             # Step 1: Deploy VLLM (건너뛰기 옵션이 활성화되지 않은 경우에만)
             if skip_vllm_creation:
                 logger.info(f"Skipping VLLM creation for request {queue_request_id} - using existing VLLM")
-                # 기존 VLLM 작업을 완전히 건너뛰고 플레이스홀더만 설정
-                vllm_deployment_info = {"deployment_id": "existing-vllm"}
+                
+                # 벤치마크 설정에서 VLLM endpoint 정보를 통해 모델명 추출
+                benchmark_configs = request.get("benchmark_configs", [])
+                target_model = await self._get_vllm_model_from_benchmark_configs(benchmark_configs)
+                
+                if target_model:
+                    deployment_id = f"existing-vllm-{target_model}"
+                    logger.info(f"Detected target VLLM model from benchmark configs: {target_model}, using deployment_id: {deployment_id}")
+                else:
+                    deployment_id = "existing-vllm"
+                    logger.warning("Could not detect target VLLM model from benchmark configs, using generic deployment_id: existing-vllm")
+                
+                # 기존 VLLM 작업을 완전히 건너뛰고 감지된 모델명으로 플레이스홀더 설정
+                vllm_deployment_info = {"deployment_id": deployment_id}
                 logger.info(f"VLLM creation skipped, proceeding with benchmark jobs only")
             else:
                 # VLLM 배포 시작 시 상태를 즉시 processing으로 변경
@@ -979,8 +1048,9 @@ class DeployerManager:
         yaml_content = benchmark_config["yaml_content"]
         
         # 기존 VLLM 사용 시 플레이스홀더를 그대로 유지 (사용자가 YAML에서 직접 처리)
-        if vllm_deployment_info["deployment_id"] == "existing-vllm":
-            logger.info("Using existing VLLM - placeholders in YAML will remain unchanged for user to configure")
+        deployment_id = vllm_deployment_info["deployment_id"]
+        if deployment_id.startswith("existing-vllm"):
+            logger.info(f"Using existing VLLM with deployment_id: {deployment_id} - placeholders in YAML will remain unchanged for user to configure")
             # 플레이스홀더를 그대로 두어 사용자가 직접 실제 서비스 이름으로 교체하도록 함
         else:
             # 새로 배포된 VLLM의 경우 실제 Helm 릴리스 정보를 사용
@@ -1074,7 +1144,7 @@ class DeployerManager:
             logger.info(f"🚨 [DEPLOYER] skip_vllm_creation flag = {skip_vllm_creation}")
             logger.info(f"🚨 [DEPLOYER] request type = {type(request)}")
             logger.info(f"🚨 [DEPLOYER] hasattr(request, 'skip_vllm_creation') = {hasattr(request, 'skip_vllm_creation')}")
-            logger.info(f"🚨 [DEPLOYER] request.__dict__ = {request.__dict__}")
+            logger.info(f"�� [DEPLOYER] request.__dict__ = {request.__dict__}")
             logger.info(f"🚨 [DEPLOYER] =================================================")
             
             if skip_vllm_creation:
@@ -1131,6 +1201,7 @@ class DeployerManager:
             github_token = None
             if request.vllm_helm_config.project_id:
                 logger.info(f"Fetching GitHub token for project: {request.vllm_helm_config.project_id}")
+                import aiohttp
                 from config import BENCHMARK_MANAGER_URL
                 async with aiohttp.ClientSession() as session:
                     project_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}"
@@ -1451,7 +1522,7 @@ class DeployerManager:
             logger.info(f"Attempting to terminate job {job_name} in namespace {namespace}")
             
             # Use Kubernetes client to delete the job
-            success = await k8s_client.delete_job(job_name, namespace)
+            success = await self.k8s_client.delete_job(job_name, namespace)
             
             if success:
                 logger.info(f"Job {job_name} terminated successfully")
@@ -1795,7 +1866,8 @@ class DeployerManager:
                 # Check VLLM deployment status if in vllm_deployment step
                 if current_step == "vllm_deployment" and request.get("vllm_deployment_id"):
                     deployment_id = request["vllm_deployment_id"]
-                    if deployment_id != "existing-vllm":  # Skip existing VLLM check
+                    # Skip existing VLLM check (모든 existing-vllm 변형 포함)
+                    if not deployment_id.startswith("existing-vllm"):
                         await self._check_vllm_deployment_status(queue_request_id, deployment_id)
                 
                 # Check benchmark job status if in benchmark steps
@@ -1834,7 +1906,7 @@ class DeployerManager:
             for job_id in benchmark_job_ids:
                 # Check job status
                 try:
-                    job_status = await k8s_client.get_job_status(job_id, request.get("namespace", "default"))
+                    job_status = await self.k8s_client.get_job_status(job_id, request.get("namespace", "default"))
                     
                     if job_status.status.value == "failed":
                         error_message = f"Benchmark job {job_id} failed"
@@ -1854,7 +1926,7 @@ class DeployerManager:
             logger.info(f"Deleting job '{job_name}' in namespace '{namespace}'")
             
             # Use Kubernetes client to delete the job
-            success = await k8s_client.delete_job(job_name, namespace)
+            success = await self.k8s_client.delete_job(job_name, namespace)
             
             if success:
                 # Update deployment status in database
