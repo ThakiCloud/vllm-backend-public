@@ -119,7 +119,7 @@ class VLLMManager:
             
             try:
                 # Deploy using Helm
-                logger.info(f"Deploying vLLM with Helm: {release_name}")
+                logger.info(f"Deploying vLLM with Helm: {release_name} {values_file}")
                 chart_path = self._get_vllm_chart_path(github_token, repository_url)
                 await self._helm_install(release_name, chart_path, namespace, values_file)
                 
@@ -380,23 +380,22 @@ class VLLMManager:
             raise RuntimeError(f"Could not clone charts repository: {e}")
     
     async def _helm_install(self, release_name: str, chart_path: str, namespace: str, values_file: str):
-        """Execute Helm install command"""
+        """Execute Helm install command asynchronously (non-blocking)"""
         try:
             # Ensure namespace exists
             await self._ensure_namespace_exists(namespace)
             
-            # Build Helm install command
+            # Build Helm install command WITHOUT --wait to make it non-blocking
             helm_cmd = [
                 "helm", "install", release_name, chart_path,
                 "--namespace", namespace,
                 "--values", values_file,
-                "--wait",
-                "--timeout", "10m"
+                # Removed --wait and --timeout to make it non-blocking
             ]
             
-            logger.info(f"Executing Helm install: {' '.join(helm_cmd)}")
+            logger.info(f"Executing Helm install (non-blocking): {' '.join(helm_cmd)}")
             
-            # Execute Helm command
+            # Execute Helm command asynchronously
             result = subprocess.run(
                 helm_cmd,
                 capture_output=True,
@@ -404,7 +403,8 @@ class VLLMManager:
                 check=True
             )
             
-            logger.info(f"Helm install output: {result.stdout}")
+            logger.info(f"Helm install initiated successfully: {result.stdout}")
+            logger.info(f"🚀 Helm install command completed instantly - deployment will continue in background")
             
         except subprocess.CalledProcessError as e:
             logger.error(f"Helm install failed: {e.stderr}")
@@ -524,13 +524,13 @@ class VLLMManager:
             logger.error(f"Failed to update deployment in database: {e}")
 
     async def wait_for_helm_deployment_ready(self, deployment_id: str, timeout: int = 600, max_failures: int = 3, failure_retry_delay: int = 30):
-        """Wait for Helm-based vLLM deployment to be ready with failure tracking"""
+        """Wait for Helm-based vLLM deployment to be ready with failure tracking (non-blocking monitoring)"""
         start_time = datetime.utcnow()
         failure_count = 0
         consecutive_failures = 0
         last_status = None
         
-        logger.info(f"Waiting for Helm vLLM deployment {deployment_id} to be ready (timeout: {timeout}s, max_failures: {max_failures})")
+        logger.info(f"🔍 Starting non-blocking monitoring for Helm deployment {deployment_id} (timeout: {timeout}s, max_failures: {max_failures})")
         
         while True:
             try:
@@ -542,13 +542,13 @@ class VLLMManager:
                 helm_status = await self._check_helm_release_status(deployment.helm_release_name, deployment.namespace)
                 current_status = helm_status.get('status', 'unknown').lower()
                 
-                logger.debug(f"Helm deployment {deployment_id} status: {current_status}")
+                logger.info(f"📊 Helm deployment {deployment_id} status: {current_status}")
                 
                 if current_status in ["deployed", "running"]:
                     # Additional check: verify pod is actually ready
                     pod_ready = await self._check_pod_readiness(deployment.helm_release_name, deployment.namespace)
                     if pod_ready:
-                        logger.info(f"Helm vLLM deployment {deployment_id} is ready")
+                        logger.info(f"✅ Helm vLLM deployment {deployment_id} is ready")
                         # Update deployment status
                         deployment.status = "running"
                         deployment.updated_at = datetime.utcnow()
@@ -556,66 +556,45 @@ class VLLMManager:
                         await self._update_deployment_in_db(deployment)
                         return
                 
-                if current_status in ["failed", "error", "uninstalling", "superseded"]:
+                elif current_status in ["failed", "error"]:
                     failure_count += 1
                     consecutive_failures += 1
+                    logger.warning(f"⚠️ Helm deployment {deployment_id} failed (attempt {failure_count}/{max_failures})")
                     
-                    logger.warning(f"Helm deployment {deployment_id} failed with status: {current_status} (failure #{failure_count})")
-                    
-                    # Check if we've exceeded maximum failures
                     if failure_count >= max_failures:
-                        logger.error(f"Helm deployment {deployment_id} has failed {failure_count} times, exceeding maximum of {max_failures}")
-                        
-                        # Attempt to clean up the failed deployment
-                        try:
-                            await self.stop_helm_deployment(deployment_id)
-                            logger.info(f"Successfully cleaned up failed Helm deployment {deployment_id}")
-                        except Exception as cleanup_error:
-                            logger.error(f"Failed to clean up Helm deployment {deployment_id}: {cleanup_error}")
-                        
-                        # Update deployment status
-                        deployment.status = "failed"
-                        deployment.error_message = f"Deployment failed {failure_count} times, exceeding maximum failures ({max_failures})"
-                        deployment.updated_at = datetime.utcnow()
-                        self.deployments[deployment_id] = deployment
-                        await self._update_deployment_in_db(deployment)
-                        
-                        raise Exception(f"Helm deployment {deployment_id} failed {failure_count} times, exceeding maximum failures ({max_failures}). Deployment has been terminated.")
+                        error_msg = f"Helm deployment failed after {max_failures} attempts. Final status: {current_status}"
+                        logger.error(f"❌ {error_msg}")
+                        raise Exception(error_msg)
                     
-                    # Wait longer before retrying after failure
-                    logger.info(f"Helm deployment {deployment_id} failed, waiting {failure_retry_delay} seconds before next check...")
+                    logger.info(f"⏳ Retrying in {failure_retry_delay}s...")
                     await asyncio.sleep(failure_retry_delay)
                     continue
                 
-                # Reset consecutive failures if deployment is recovering
-                if current_status in ["pending-install", "pending-upgrade"] and last_status in ["failed", "error"]:
-                    consecutive_failures = 0
-                    logger.info(f"Helm deployment {deployment_id} is recovering from failure")
+                elif current_status == "pending-install":
+                    logger.info(f"⏳ Helm deployment {deployment_id} is pending installation...")
+                    consecutive_failures = 0  # Reset on progress
                 
+                elif current_status == "pending-upgrade":
+                    logger.info(f"⏳ Helm deployment {deployment_id} is pending upgrade...")
+                    consecutive_failures = 0  # Reset on progress
+                
+                else:
+                    # Unknown or transitional status
+                    if current_status != last_status:
+                        logger.info(f"🔄 Helm deployment {deployment_id} status changed: {last_status} -> {current_status}")
+                        consecutive_failures = 0  # Reset on status change
+                    
                 last_status = current_status
                 
                 # Check timeout
                 elapsed = (datetime.utcnow() - start_time).total_seconds()
                 if elapsed > timeout:
-                    logger.error(f"Timeout waiting for Helm deployment {deployment_id} to be ready after {elapsed}s (timeout: {timeout}s)")
-                    
-                    # Attempt to clean up the timed-out deployment
-                    try:
-                        await self.stop_helm_deployment(deployment_id)
-                        logger.info(f"Successfully cleaned up timed-out Helm deployment {deployment_id}")
-                    except Exception as cleanup_error:
-                        logger.error(f"Failed to clean up timed-out Helm deployment {deployment_id}: {cleanup_error}")
-                    
-                    # Update deployment status
-                    deployment.status = "failed"
-                    deployment.error_message = f"Timeout waiting for deployment to be ready (timeout: {timeout}s)"
-                    deployment.updated_at = datetime.utcnow()
-                    self.deployments[deployment_id] = deployment
-                    await self._update_deployment_in_db(deployment)
-                    
-                    raise Exception(f"Timeout waiting for Helm deployment {deployment_id} to be ready (timeout: {timeout}s). Deployment has been terminated.")
+                    error_msg = f"Helm deployment timed out after {timeout}s. Final status: {current_status}"
+                    logger.error(f"⏰ {error_msg}")
+                    raise Exception(error_msg)
                 
-                # Normal polling interval
+                # Non-blocking sleep - allows other operations to continue
+                logger.debug(f"💤 Sleeping 10s before next status check (non-blocking)")
                 await asyncio.sleep(10)  # Check every 10 seconds
                 
             except Exception as e:
@@ -624,7 +603,7 @@ class VLLMManager:
                     raise
                 else:
                     # Unexpected error, log and continue
-                    logger.warning(f"Unexpected error checking Helm deployment status: {e}")
+                    logger.warning(f"⚠️ Unexpected error checking Helm deployment status: {e}")
                     await asyncio.sleep(10)
     
     async def _check_helm_release_status(self, release_name: str, namespace: str) -> Dict[str, Any]:

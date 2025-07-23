@@ -77,12 +77,16 @@ spec:
             port: 8005
           initialDelaySeconds: 30
           periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 25  # Allow 25 failures = 30s * 25 = 12.5 minutes
         readinessProbe:
           httpGet:
             path: /health
             port: 8005
           initialDelaySeconds: 5
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 10  # Allow 10 failures = 10s * 10 = 100 seconds
       volumes:
       - name: config-volume
         configMap:
