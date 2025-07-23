@@ -556,7 +556,12 @@ class QueueManager:
     async def _process_next_request(self):
         """Process the next pending request in the queue"""
         try:
+            logger.info(f"🔍 [SCHEDULER] Checking for pending requests...")
             await self._load_queue_requests_from_db()
+            
+            logger.info(f"🔍 [SCHEDULER] Total queue requests in memory: {len(self.queue_requests)}")
+            for req_id, req_doc in self.queue_requests.items():
+                logger.info(f"🔍 [SCHEDULER] Request {req_id}: status={req_doc.get('status', 'unknown')}")
             
             # Find the next pending request with highest priority
             pending_requests = [
@@ -564,7 +569,10 @@ class QueueManager:
                 if queue_doc["status"] == "pending"
             ]
             
+            logger.info(f"🔍 [SCHEDULER] Found {len(pending_requests)} pending requests")
+            
             if not pending_requests:
+                logger.info(f"🔍 [SCHEDULER] No pending requests found - sleeping...")
                 return
             
             # Sort by priority and created_at
@@ -572,6 +580,8 @@ class QueueManager:
             pending_requests.sort(key=lambda x: (priority_order.get(x[1]["priority"], 4), x[1]["created_at"]))
             
             request_id, queue_doc = pending_requests[0]
+            
+            logger.info(f"🔍 [SCHEDULER] Processing next request: {request_id}")
             
             # Update status to processing immediately when starting
             queue_doc["status"] = "processing"
