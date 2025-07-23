@@ -140,10 +140,11 @@ class VLLMManager:
                 logger.info(f"Helm deployment started successfully: {release_name}")
                 return VLLMDeploymentResponse(
                     deployment_id=deployment_id,
+                    deployment_name=release_name,  # Use release_name as deployment_name
                     status="deploying",
-                    message=f"vLLM deployment started with Helm release: {release_name}",
-                    namespace=namespace,
-                    helm_release_name=release_name
+                    config=config,  # Pass the VLLMConfig
+                    created_at=datetime.utcnow(),  # Add created_at timestamp
+                    message=f"vLLM deployment started with Helm release: {release_name}"
                 )
                 
             finally:
