@@ -656,26 +656,56 @@ class QueueManager:
                         logger.error(f"=== VLLM DEPLOYMENT FAILED for request {request_id} ===")
                         logger.error(f"VLLM Error: {vllm_error}")
                         
-                        # Clean up failed deployment ONLY if deployment was actually attempted
+                        # Always try to clean up if we have deployment info
+                        cleanup_attempted = False
+                        cleanup_successful = False
+                        
+                        # Clean up failed deployment if Helm install was attempted
                         if deployment_response is not None:
-                            logger.info(f"🧹 Cleaning up failed VLLM deployment {deployment_response.deployment_id}")
-                            cleanup_success = await vllm_manager.cleanup_failed_helm_deployment(deployment_response.deployment_id)
-                            if cleanup_success:
-                                logger.info(f"✅ Successfully cleaned up failed deployment {deployment_response.deployment_id}")
-                            else:
-                                logger.warning(f"⚠️ Failed to clean up deployment {deployment_response.deployment_id} - manual cleanup may be required")
+                            logger.info(f"🧹 Attempting cleanup of failed VLLM deployment {deployment_response.deployment_id}")
+                            cleanup_attempted = True
+                            
+                            try:
+                                cleanup_successful = await vllm_manager.cleanup_failed_helm_deployment(deployment_response.deployment_id)
+                                if cleanup_successful:
+                                    logger.info(f"✅ Successfully cleaned up failed deployment {deployment_response.deployment_id}")
+                                else:
+                                    logger.error(f"❌ Failed to clean up deployment {deployment_response.deployment_id}")
+                                    
+                                    # Force cleanup using release name if available
+                                    if hasattr(deployment_response, 'deployment_name') and deployment_response.deployment_name:
+                                        logger.info(f"🔄 Attempting force cleanup using release name: {deployment_response.deployment_name}")
+                                        await self._force_helm_cleanup(deployment_response.deployment_name, 'vllm')
+                                        logger.info(f"🧹 Force cleanup completed for {deployment_response.deployment_name}")
+                                        
+                            except Exception as cleanup_error:
+                                logger.error(f"💥 Exception during cleanup: {cleanup_error}")
+                                
+                                # Last resort: try force cleanup with release name
+                                if hasattr(deployment_response, 'deployment_name') and deployment_response.deployment_name:
+                                    try:
+                                        logger.info(f"🚨 Last resort: force cleaning release {deployment_response.deployment_name}")
+                                        await self._force_helm_cleanup(deployment_response.deployment_name, 'vllm')
+                                        logger.info(f"🧹 Last resort cleanup completed")
+                                    except Exception as force_cleanup_error:
+                                        logger.error(f"💥 Force cleanup also failed: {force_cleanup_error}")
                         else:
                             logger.info(f"🚫 No cleanup needed - VLLM deployment was not attempted or failed before Helm install")
                         
-                        logger.info(f"Skipping ALL benchmark jobs due to VLLM deployment failure")
+                        # Update queue status to failed
+                        queue_doc["status"] = "failed"
+                        queue_doc["error"] = str(vllm_error)
+                        queue_doc["cleanup_attempted"] = cleanup_attempted
+                        queue_doc["cleanup_successful"] = cleanup_successful
+                        queue_doc["current_step"] = "failed"
+                        
+                        logger.error(f"🚫 Skipping ALL benchmark jobs due to VLLM deployment failure")
+                        logger.error(f"📋 Cleanup summary - Attempted: {cleanup_attempted}, Successful: {cleanup_successful}")
                         logger.info(f"This request will be marked as failed and no further processing will occur")
                         
-                        # Mark the current step as VLLM failure
-                        queue_doc["current_step"] = "vllm_deployment_failed"
-                        queue_doc["error_message"] = f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {str(vllm_error)}"
-                        
-                        # Re-raise the exception to be caught by the outer try-catch
-                        raise Exception(f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {str(vllm_error)}")
+                        # Save failed state and exit processing for this request
+                        await self._save_queue_request_to_db(request_id, queue_doc)
+                        raise Exception(f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {vllm_error}")
                     
                     # Execute benchmark jobs if any (only if VLLM deployment succeeded or was skipped)
                     if queue_doc["benchmark_configs"]:
@@ -1105,6 +1135,39 @@ class QueueManager:
                 logger.debug(f"Updated queue request {queue_request_id} with {len(created_job_names)} created job names")
         except Exception as e:
             logger.warning(f"Failed to update queue request job names: {e}")
+
+    async def _force_helm_cleanup(self, release_name: str, namespace: str = 'vllm'):
+        """Force cleanup of a Helm release by directly executing helm uninstall command"""
+        try:
+            logger.info(f"🚨 Force cleanup: Executing helm uninstall for release: {release_name} in namespace: {namespace}")
+            
+            import subprocess
+            
+            # Execute Helm uninstall command
+            helm_cmd = [
+                "helm", "uninstall", release_name,
+                "--namespace", namespace
+            ]
+            
+            logger.info(f"🔧 Executing force cleanup command: {' '.join(helm_cmd)}")
+            
+            result = subprocess.run(
+                helm_cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            logger.info(f"✅ Force cleanup successful: {result.stdout}")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Force cleanup failed - Helm uninstall error: {e.stderr}")
+            # Don't re-raise - this is a last resort cleanup attempt
+            return False
+        except Exception as e:
+            logger.error(f"💥 Force cleanup failed - Unexpected error: {e}")
+            return False
 
 # Global queue manager instance
 queue_manager = QueueManager(

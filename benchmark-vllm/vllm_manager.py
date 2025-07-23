@@ -694,8 +694,15 @@ class VLLMManager:
                     logger.warning(f"⚠️ Helm deployment {deployment_id} failed (attempt {failure_count}/{max_failures})")
                     
                     if failure_count >= max_failures:
-                        error_msg = f"Helm deployment failed after {max_failures} attempts. Final status: {current_status}"
-                        logger.error(f"❌ {error_msg}")
+                        error_msg = f"❌ VLLM Helm deployment FAILED after {max_failures} attempts. Final status: {current_status}. This deployment will be cleaned up."
+                        logger.error(f"{error_msg}")
+                        
+                        # Update deployment status to failed before raising exception
+                        deployment.status = "failed"
+                        deployment.updated_at = datetime.utcnow()
+                        self.deployments[deployment_id] = deployment
+                        await self._update_deployment_in_db(deployment)
+                        
                         raise Exception(error_msg)
                     
                     logger.info(f"⏳ Retrying in {failure_retry_delay}s...")
@@ -721,8 +728,15 @@ class VLLMManager:
                 # Check timeout
                 elapsed = (datetime.utcnow() - start_time).total_seconds()
                 if elapsed > timeout:
-                    error_msg = f"Helm deployment timed out after {timeout}s. Final status: {current_status}"
-                    logger.error(f"⏰ {error_msg}")
+                    error_msg = f"⏰ VLLM Helm deployment TIMED OUT after {timeout}s. Final status: {current_status}. This deployment will be cleaned up."
+                    logger.error(f"{error_msg}")
+                    
+                    # Update deployment status to failed before raising exception
+                    deployment.status = "failed"
+                    deployment.updated_at = datetime.utcnow()
+                    self.deployments[deployment_id] = deployment
+                    await self._update_deployment_in_db(deployment)
+                    
                     raise Exception(error_msg)
                 
                 # Non-blocking sleep - allows other operations to continue
