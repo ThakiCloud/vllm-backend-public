@@ -609,6 +609,21 @@ class QueueManager:
                     
                     try:
                         # Deploy VLLM using Helm chart
+                        logger.info(f"Creating VLLMConfig from queue data for request {request_id}")
+                        
+                        # Log custom values information
+                        vllm_config_data = queue_doc["vllm_config"]
+                        custom_values_content = vllm_config_data.get("custom_values_content")
+                        custom_values_path = vllm_config_data.get("custom_values_path")
+                        
+                        if custom_values_content:
+                            logger.info(f"✅ Found custom_values_content in queue (size: {len(custom_values_content)} chars)")
+                            logger.info(f"Custom values preview: {custom_values_content[:200]}..." if len(custom_values_content) > 200 else f"Custom values content: {custom_values_content}")
+                        elif custom_values_path:
+                            logger.info(f"✅ Found custom_values_path in queue: {custom_values_path}")
+                        else:
+                            logger.info(f"❌ No custom values found in queue - will use generated values from config")
+                        
                         vllm_config = VLLMConfig(**queue_doc["vllm_config"])
                         github_token = queue_doc.get("github_token")  # Get GitHub token from queue
                         repository_url = queue_doc.get("repository_url")  # Get repository URL from queue

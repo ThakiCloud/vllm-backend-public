@@ -85,23 +85,31 @@ class VLLMManager:
             # Create Helm values from vLLM config or use custom values
             if config.custom_values_content:
                 # Use provided custom values content
-                logger.info("Using custom values content provided in config")
+                logger.info("🎯 Using custom values content provided in config")
+                logger.info(f"Custom values content size: {len(config.custom_values_content)} chars")
+                logger.info(f"Custom values preview: {config.custom_values_content[:300]}..." if len(config.custom_values_content) > 300 else f"Custom values content: {config.custom_values_content}")
+                
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
                     f.write(config.custom_values_content)
                     values_file = f.name
+                    logger.info(f"📄 Created custom values temp file: {values_file}")
+                    
             elif config.custom_values_path and os.path.exists(config.custom_values_path):
                 # Use custom values file
-                logger.info(f"Using custom values file: {config.custom_values_path}")
+                logger.info(f"🎯 Using custom values file: {config.custom_values_path}")
                 values_file = config.custom_values_path
             else:
                 # Generate values from config (existing behavior)
-                logger.info("Generating Helm values from VLLMConfig")
+                logger.info("🏭 Generating Helm values from VLLMConfig (no custom values found)")
                 helm_values = self._create_helm_values_from_config(config, deployment_id)
                 
                 # Write values to temporary file
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
                     yaml.dump(helm_values, f, default_flow_style=False)
                     values_file = f.name
+                    logger.info(f"📄 Created generated values temp file: {values_file}")
+                    
+            logger.info(f"📋 Final values file that will be used for Helm install: {values_file}")
             
             try:
                 # Deploy using Helm
