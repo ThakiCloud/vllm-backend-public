@@ -227,6 +227,25 @@ class VLLMManager:
             logger.info(f"📋 Final values file that will be used for Helm install: {values_file}")
             
             try:
+                # Check if existing deployment conflicts with new one
+                deployment_action = await self._check_and_cleanup_conflicting_helm_release(release_name, namespace, config)
+                
+                if deployment_action == "skip":
+                    logger.info(f"✅ Same configuration already exists, skipping deployment")
+                    # Return existing deployment info
+                    return VLLMDeploymentResponse(
+                        status="success",
+                        message=f"VLLM deployment skipped - same configuration already exists: {release_name}",
+                        deployment_id="skipped-same-config",
+                        helm_release_name=release_name,
+                        namespace=namespace,
+                        service_name=f"{release_name}-service",
+                        pod_name=f"{release_name}-0"
+                    )
+                elif deployment_action == "cleanup_and_install":
+                    logger.info(f"⚠️ Different configuration detected, cleaning up existing deployment")
+                    await self._cleanup_conflicting_helm_resources(release_name, namespace)
+                
                 # Deploy using Helm
                 logger.info(f"Deploying vLLM with Helm: {release_name} {values_file}")
                 chart_path = self._get_vllm_chart_path(github_token, repository_url)
@@ -511,6 +530,160 @@ class VLLMManager:
             logger.error(f"Failed to clone charts repository: {e}")
             raise RuntimeError(f"Could not clone charts repository: {e}")
     
+    async def _check_and_cleanup_conflicting_helm_release(self, release_name: str, namespace: str, new_config: VLLMConfig) -> str:
+        """
+        Check if existing Helm release conflicts with new deployment
+        Returns: 'install', 'skip', or 'cleanup_and_install'
+        """
+        try:
+            logger.info(f"Checking for conflicting Helm release: {release_name} in namespace: {namespace}")
+            
+            # Check if release exists
+            check_cmd = ["helm", "list", "-n", namespace, "-o", "json"]
+            result = subprocess.run(
+                check_cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode != 0:
+                logger.info(f"No existing releases found in namespace {namespace}")
+                return "install"
+            
+            try:
+                releases = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse helm list output")
+                return "install"
+            
+            # Find matching release
+            existing_release = None
+            for release in releases:
+                if release.get("name") == release_name:
+                    existing_release = release
+                    break
+            
+            if not existing_release:
+                logger.info(f"No existing release found with name: {release_name}")
+                return "install"
+            
+            # Get detailed release information
+            get_cmd = ["helm", "get", "values", release_name, "-n", namespace, "-o", "json"]
+            result = subprocess.run(
+                get_cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode != 0:
+                logger.warning(f"Failed to get existing release values: {result.stderr}")
+                return "cleanup_and_install"
+            
+            try:
+                existing_values = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse existing release values")
+                return "cleanup_and_install"
+            
+            # Compare configurations
+            new_model = new_config.model_name
+            existing_model = None
+            
+            # Extract model from existing values
+            if isinstance(existing_values, dict):
+                # Try different possible paths for model name
+                vllm_section = existing_values.get('vllm', {})
+                if isinstance(vllm_section, dict):
+                    existing_model = vllm_section.get('model')
+                
+                # Also check args array for --model parameter
+                if not existing_model:
+                    args = existing_values.get('args', [])
+                    if isinstance(args, list):
+                        for i, arg in enumerate(args):
+                            if arg == '--model' and i + 1 < len(args):
+                                existing_model = args[i + 1]
+                                break
+            
+            logger.info(f"Comparing models - existing: {existing_model}, new: {new_model}")
+            
+            # If models are the same, skip deployment
+            if existing_model and new_model and existing_model == new_model:
+                logger.info(f"Same model configuration detected ({existing_model}), skipping deployment")
+                return "skip"
+            
+            # Different models or unable to compare - cleanup and install
+            logger.info(f"Different configuration detected, will cleanup and reinstall")
+            return "cleanup_and_install"
+            
+        except Exception as e:
+            logger.error(f"Error checking existing Helm release: {e}")
+            # When in doubt, cleanup and install to avoid conflicts
+            return "cleanup_and_install"
+
+    async def _cleanup_conflicting_helm_resources(self, release_name: str, namespace: str):
+        """Clean up conflicting Kubernetes resources before Helm install"""
+        try:
+            logger.info(f"Cleaning up conflicting resources for release: {release_name} in namespace: {namespace}")
+            
+            # First, try to uninstall existing Helm release
+            await self._uninstall_helm_release(release_name, namespace)
+            
+            # Clean up any remaining resources that might cause conflicts
+            resource_patterns = [
+                f"{release_name}-sa",  # ServiceAccount
+                f"vllm-{release_name.replace('vllm-', '')}-sa",  # Alternative ServiceAccount pattern
+                f"{release_name}",     # Other resources with same name
+            ]
+            
+            for pattern in resource_patterns:
+                try:
+                    # Clean up ServiceAccounts
+                    delete_sa_cmd = ["kubectl", "delete", "serviceaccount", pattern, "-n", namespace, "--ignore-not-found=true"]
+                    subprocess.run(delete_sa_cmd, capture_output=True, text=True, check=False)
+                    
+                    # Clean up other resources with labels
+                    delete_labeled_cmd = ["kubectl", "delete", "all", "-l", f"app.kubernetes.io/instance={release_name}", "-n", namespace, "--ignore-not-found=true"]
+                    subprocess.run(delete_labeled_cmd, capture_output=True, text=True, check=False)
+                    
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup resource {pattern}: {cleanup_error}")
+                    continue
+            
+            # Wait a bit for resources to be fully deleted
+            await asyncio.sleep(5)
+            
+            logger.info(f"Cleanup completed for release: {release_name}")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            # Don't fail the deployment if cleanup fails
+            pass
+
+    async def _uninstall_helm_release(self, release_name: str, namespace: str):
+        """Uninstall existing Helm release"""
+        try:
+            logger.info(f"Uninstalling Helm release: {release_name} from namespace: {namespace}")
+            
+            uninstall_cmd = ["helm", "uninstall", release_name, "-n", namespace]
+            result = subprocess.run(
+                uninstall_cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"Successfully uninstalled Helm release: {release_name}")
+            else:
+                logger.warning(f"Failed to uninstall Helm release {release_name}: {result.stderr}")
+                
+        except Exception as e:
+            logger.warning(f"Error uninstalling Helm release {release_name}: {e}")
+            # Don't fail if uninstall fails
+
     async def _helm_install(self, release_name: str, chart_path: str, namespace: str, values_file: str):
         """Execute Helm install command asynchronously (non-blocking)"""
         try:
