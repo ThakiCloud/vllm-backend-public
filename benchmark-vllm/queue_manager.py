@@ -591,43 +591,43 @@ class QueueManager:
                     logger.info(f"Processing regular queue request {request_id}")
                 
                 # Unified processing logic for both regular and Helm deployments:
-                    # Check if VLLM creation should be skipped
-                    skip_vllm_creation = queue_doc.get("skip_vllm_creation", False)
+                # Check if VLLM creation should be skipped
+                skip_vllm_creation = queue_doc.get("skip_vllm_creation", False)
+                
+                if skip_vllm_creation:
+                    logger.info(f"Skipping VLLM creation for request {request_id} - using existing VLLM")
+                    # Skip VLLM deployment and proceed to benchmark jobs
+                    queue_doc["deployment_id"] = "existing-vllm"
+                    queue_doc["current_step"] = "benchmark_jobs"
+                else:
+                    # Regular VLLM deployment
+                    logger.info(f"Processing VLLM deployment queue request {request_id}")
                     
-                    if skip_vllm_creation:
-                        logger.info(f"Skipping VLLM creation for request {request_id} - using existing VLLM")
-                        # Skip VLLM deployment and proceed to benchmark jobs
-                        queue_doc["deployment_id"] = "existing-vllm"
-                        queue_doc["current_step"] = "benchmark_jobs"
-                    else:
-                        # Regular VLLM deployment
-                        logger.info(f"Processing regular VLLM deployment queue request {request_id}")
+                    # Check if vllm_config is valid before deploying
+                    if not queue_doc["vllm_config"] or not queue_doc["vllm_config"].get("model_name"):
+                        raise Exception("Invalid or empty VLLM configuration")
+                    
+                    try:
+                        # Deploy VLLM using Helm chart
+                        vllm_config = VLLMConfig(**queue_doc["vllm_config"])
+                        github_token = queue_doc.get("github_token")  # Get GitHub token from queue
+                        repository_url = queue_doc.get("repository_url")  # Get repository URL from queue
+                        deployment_response = await vllm_manager.deploy_vllm_with_helm(vllm_config, request_id, github_token, repository_url)
                         
-                        # Check if vllm_config is valid before deploying
-                        if not queue_doc["vllm_config"] or not queue_doc["vllm_config"].get("model_name"):
-                            raise Exception("Invalid or empty VLLM configuration")
+                        queue_doc["deployment_id"] = deployment_response.deployment_id
+                        queue_doc["helm_release_name"] = getattr(deployment_response, 'helm_release_name', None)
                         
-                        try:
-                            # Deploy VLLM using Helm chart
-                            vllm_config = VLLMConfig(**queue_doc["vllm_config"])
-                            github_token = queue_doc.get("github_token")  # Get GitHub token from queue
-                            repository_url = queue_doc.get("repository_url")  # Get repository URL from queue
-                            deployment_response = await vllm_manager.deploy_vllm_with_helm(vllm_config, request_id, github_token, repository_url)
-                            
-                            queue_doc["deployment_id"] = deployment_response.deployment_id
-                            queue_doc["helm_release_name"] = getattr(deployment_response, 'helm_release_name', None)
-                            
-                            # Wait for VLLM to be ready (this can now fail after 3 attempts)
-                            logger.info(f"Waiting for VLLM Helm deployment {deployment_response.deployment_id} to be ready...")
-                            await vllm_manager.wait_for_helm_deployment_ready(
-                                deployment_response.deployment_id,
-                                timeout=VLLM_TIMEOUT,
-                                max_failures=VLLM_MAX_FAILURES,
-                                failure_retry_delay=VLLM_FAILURE_RETRY_DELAY
-                            )
-                            logger.info(f"VLLM deployment {deployment_response.deployment_id} is ready, proceeding with benchmark jobs")
-                            
-                        except Exception as vllm_error:
+                        # Wait for VLLM to be ready (this can now fail after 3 attempts)
+                        logger.info(f"Waiting for VLLM Helm deployment {deployment_response.deployment_id} to be ready...")
+                        await vllm_manager.wait_for_helm_deployment_ready(
+                            deployment_response.deployment_id,
+                            timeout=VLLM_TIMEOUT,
+                            max_failures=VLLM_MAX_FAILURES,
+                            failure_retry_delay=VLLM_FAILURE_RETRY_DELAY
+                        )
+                        logger.info(f"VLLM deployment {deployment_response.deployment_id} is ready, proceeding with benchmark jobs")
+                        
+                    except Exception as vllm_error:
                             # VLLM deployment failed - do NOT proceed with benchmark jobs
                             logger.error(f"=== VLLM DEPLOYMENT FAILED for request {request_id} ===")
                             logger.error(f"VLLM Error: {vllm_error}")
