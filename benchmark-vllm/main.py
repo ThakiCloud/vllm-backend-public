@@ -438,6 +438,16 @@ async def resume_scheduler():
         logger.error(f"Failed to resume scheduler: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/debug/last-custom-values")
+async def get_last_custom_values_debug():
+    """Debug endpoint to check last custom values tracking state"""
+    return {
+        "last_custom_values_hash": vllm_manager.last_custom_values_hash,
+        "last_deployment_info": vllm_manager.last_deployment_info,
+        "has_last_custom_values_content": bool(vllm_manager.last_custom_values_content),
+        "custom_values_content_length": len(vllm_manager.last_custom_values_content) if vllm_manager.last_custom_values_content else 0
+    }
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
