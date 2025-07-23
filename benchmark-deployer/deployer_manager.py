@@ -51,7 +51,7 @@ class DeployerManager:
         logger.info("Initializing DeployerManager...")
         
         # Initialize MongoDB connection
-        self.db = get_database()
+        self.db = await get_database()
         logger.info("MongoDB connection established")
         
         # Initialize Kubernetes client
