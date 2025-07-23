@@ -618,10 +618,18 @@ class QueueManager:
                 
                 if skip_vllm_creation:
                     logger.info(f"🚨 [BENCHMARK-VLLM] ✅ SKIPPING VLLM creation for request {request_id} - using existing VLLM")
-                    # Skip VLLM deployment and proceed to benchmark jobs
-                    queue_doc["deployment_id"] = "existing-vllm"
+                    
+                    # Get current running VLLM model name
+                    current_vllm_model = await self._get_current_vllm_model()
+                    if current_vllm_model:
+                        queue_doc["deployment_id"] = f"existing-{current_vllm_model}"
+                        logger.info(f"🚨 [BENCHMARK-VLLM] ✅ Using existing VLLM model: {current_vllm_model}")
+                    else:
+                        queue_doc["deployment_id"] = "existing-vllm"
+                        logger.info(f"🚨 [BENCHMARK-VLLM] ⚠️ Could not detect current VLLM model, using generic name")
+                    
                     queue_doc["current_step"] = "benchmark_jobs"
-                    logger.info(f"🚨 [BENCHMARK-VLLM] ✅ Set deployment_id='existing-vllm', current_step='benchmark_jobs'")
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ✅ Set deployment_id='{queue_doc['deployment_id']}', current_step='benchmark_jobs'")
                 else:
                     logger.info(f"🚨 [BENCHMARK-VLLM] ❌ NOT SKIPPING VLLM creation - proceeding with deployment for request {request_id}")
                     # Regular VLLM deployment
@@ -984,6 +992,7 @@ class QueueManager:
         last_status = None
         check_count = 0  # 총 체크 횟수 추적
         max_checks = timeout // 30 + 10  # 최대 체크 횟수 제한 (안전장치)
+        not_found_count = 0  # job이 연속으로 찾을 수 없는 횟수
         
         logger.info(f"Waiting for job {job_name} to complete (timeout: {timeout}s, max_failures: {max_failures})")
         
@@ -997,13 +1006,14 @@ class QueueManager:
                     
                     async with session.get(status_url, params=params) as response:
                         if response.status == 200:
+                            not_found_count = 0  # Reset not found counter
                             status_data = await response.json()
                             job_status = status_data.get("status", "unknown").lower()
                             
                             logger.debug(f"Job {job_name} status: {job_status} (check #{check_count})")
                             
                             if job_status in ['succeeded', 'completed']:
-                                logger.info(f"Job {job_name} completed successfully")
+                                logger.info(f"✅ Job {job_name} completed successfully")
                                 return
                             
                             if job_status in ['failed', 'error']:
@@ -1038,9 +1048,13 @@ class QueueManager:
                             last_status = job_status
                         
                         elif response.status == 404:
-                            # Job not found, might be completed and cleaned up
-                            logger.info(f"Job {job_name} not found, assuming completed")
-                            return
+                            not_found_count += 1
+                            logger.info(f"Job {job_name} not found (attempt {not_found_count}/3), might be completed and cleaned up by ttlSecondsAfterFinished")
+                            
+                            # If job is not found multiple times consecutively, assume it completed and was cleaned up
+                            if not_found_count >= 3:
+                                logger.info(f"✅ Job {job_name} not found for {not_found_count} consecutive checks - assuming completed and auto-cleaned")
+                                return
                         
                         else:
                             logger.warning(f"Failed to get status for job {job_name}: HTTP {response.status}")
@@ -1131,20 +1145,23 @@ class QueueManager:
             
             logger.info(f"🔍 [DB-LOAD] Loading queue requests from collection: vllm_deployment_queue")
             
-            # Load pending and processing requests
+            # Load ALL requests to maintain history, but prioritize pending and processing for scheduling
+            all_requests_count = 0
             pending_and_processing_count = 0
-            async for queue_doc in collection.find({"status": {"$in": ["pending", "processing"]}}):
+            
+            async for queue_doc in collection.find().sort("created_at", -1):  # Load all, newest first
                 request_id = queue_doc["queue_request_id"]
-                pending_and_processing_count += 1
-                logger.info(f"🔍 [DB-LOAD] Loading request {request_id} with status {queue_doc['status']}")
+                all_requests_count += 1
+                
+                # Always load into memory for history purposes
                 self.queue_requests[request_id] = queue_doc
-                logger.info(f"Loaded queue request {request_id} with status {queue_doc['status']}")
-            
-            logger.info(f"🔍 [DB-LOAD] Loaded {pending_and_processing_count} requests with pending/processing status")
-            
-            # Get total count for debugging
-            all_count = await collection.count_documents({})
-            logger.info(f"🔍 [DB-LOAD] Total requests in collection: {all_count}")
+                
+                # Count pending and processing separately
+                if queue_doc['status'] in ["pending", "processing"]:
+                    pending_and_processing_count += 1
+                    logger.info(f"🔍 [DB-LOAD] Loading active request {request_id} with status {queue_doc['status']}")
+                
+            logger.info(f"🔍 [DB-LOAD] Loaded {all_requests_count} total requests ({pending_and_processing_count} active)")
             
         except Exception as e:
             logger.error(f"Failed to load queue requests from database: {e}")
@@ -1200,6 +1217,48 @@ class QueueManager:
         except Exception as e:
             logger.error(f"💥 Force cleanup failed - Unexpected error: {e}")
             return False
+
+    async def _get_current_vllm_model(self) -> Optional[str]:
+        """Get the name of the currently running VLLM model from Kubernetes."""
+        try:
+            from kubernetes import client, config
+            
+            # Load Kubernetes config
+            try:
+                config.load_incluster_config()  # For in-cluster
+            except:
+                try:
+                    config.load_kube_config()  # For local development
+                except Exception as e:
+                    logger.warning(f"Could not load Kubernetes config: {e}")
+                    return None
+            
+            v1 = client.AppsV1Api()
+            
+            # Look for VLLM deployments in the vllm namespace
+            try:
+                deployments = v1.list_namespaced_deployment(namespace='vllm')
+                
+                for deployment in deployments.items:
+                    # Check if deployment is ready and running
+                    if (deployment.status.ready_replicas and 
+                        deployment.status.ready_replicas > 0 and
+                        deployment.metadata.name.startswith('vllm-')):
+                        
+                        model_name = deployment.metadata.name
+                        logger.info(f"Found running VLLM model: {model_name}")
+                        return model_name
+                        
+                logger.info("No running VLLM deployments found in vllm namespace")
+                return None
+                
+            except Exception as e:
+                logger.warning(f"Error listing deployments in vllm namespace: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting current VLLM model: {e}")
+            return None
 
 # Global queue manager instance
 queue_manager = QueueManager(
