@@ -922,22 +922,40 @@ class QueueManager:
             try:
                 # Call Benchmark Deployer API to deploy the job
                 logger.info(f"📤 Deploying job {job_name} to deployer service...")
-                deployment_result = await self._deploy_benchmark_job_to_deployer(
-                    yaml_content=yaml_content,
-                    namespace=namespace,
-                    job_name=job_name,
-                    deployer_base_url=deployer_base_url
-                )
+                deployment_error = None
+                actual_job_name = job_name  # Default to job_name
                 
-                # Get the actual resource name from deployment response
-                actual_job_name = deployment_result.get('actual_resource_name', job_name)
-                logger.info(f"✅ Job {job_name} deployed successfully as {actual_job_name}")
+                try:
+                    deployment_result = await self._deploy_benchmark_job_to_deployer(
+                        yaml_content=yaml_content,
+                        namespace=namespace,
+                        job_name=job_name,
+                        deployer_base_url=deployer_base_url
+                    )
+                    
+                    # Get the actual resource name from deployment response
+                    actual_job_name = deployment_result.get('actual_resource_name', job_name)
+                    logger.info(f"✅ Job {job_name} deployed successfully as {actual_job_name}")
+                    
+                except Exception as deploy_error:
+                    deployment_error = deploy_error
+                    logger.error(f"⚠️ Deployer API error for job {job_name}: {deploy_error}")
+                    logger.info(f"🔍 Checking if job was actually created despite API error...")
+                    
+                    # Check if job was actually created despite the API error
+                    job_exists = await self._check_if_job_exists(actual_job_name, namespace, deployer_base_url)
+                    if job_exists:
+                        logger.info(f"✅ Job {actual_job_name} was created despite API error - continuing with monitoring")
+                    else:
+                        logger.error(f"❌ Job {actual_job_name} was not created - deployment actually failed")
+                        raise deploy_error  # Re-raise the original error
                 
                 # Store the created job information for later cleanup
                 job_info = {
                     'name': actual_job_name,
                     'namespace': namespace,
-                    'original_name': job_name
+                    'original_name': job_name,
+                    'had_deployment_error': deployment_error is not None
                 }
                 created_job_names.append(job_info)
                 
@@ -962,6 +980,8 @@ class QueueManager:
                 
                 logger.info(f"✅ Benchmark job {actual_job_name} completed successfully!")
                 logger.info(f"📊 Job timing - Wait: {wait_duration:.1f}s, Total: {job_total_duration:.1f}s")
+                if deployment_error:
+                    logger.info(f"📝 Note: Job completed successfully despite initial deployment API error")
                 successful_jobs += 1
                 
             except Exception as e:
@@ -1024,6 +1044,35 @@ class QueueManager:
                 result['actual_resource_name'] = actual_resource_name
                 
                 return result
+
+    async def _check_if_job_exists(self, job_name: str, namespace: str, deployer_base_url: str) -> bool:
+        """Check if a job exists by trying to get its status"""
+        try:
+            # Wait a moment for the job to be created
+            await asyncio.sleep(2)
+            
+            async with aiohttp.ClientSession() as session:
+                status_url = f"{deployer_base_url}/jobs/{job_name}/status"
+                params = {"namespace": namespace}
+                
+                async with session.get(status_url, params=params) as response:
+                    if response.status == 200:
+                        # Job exists and we can get its status
+                        status_data = await response.json()
+                        logger.info(f"🔍 Job {job_name} exists with status: {status_data.get('status', 'unknown')}")
+                        return True
+                    elif response.status == 404:
+                        # Job doesn't exist
+                        logger.info(f"🔍 Job {job_name} not found - deployment failed")
+                        return False
+                    else:
+                        # Other error - assume job doesn't exist
+                        logger.warning(f"🔍 Could not check job {job_name} status: HTTP {response.status}")
+                        return False
+                        
+        except Exception as e:
+            logger.warning(f"🔍 Error checking if job {job_name} exists: {e}")
+            return False
 
     async def _wait_for_job_completion(self, job_name: str, namespace: str, deployer_base_url: str, timeout: int = 3600, max_failures: int = 3):
         """Wait for job completion with failure tracking and retry logic"""
