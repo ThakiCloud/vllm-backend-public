@@ -78,8 +78,14 @@ class VLLMManager:
         try:
             logger.info(f"Starting Helm-based vLLM deployment: {deployment_id}")
             
+            # Extract model name from custom values if available
+            actual_model_name = config.model_name  # Default fallback
+            if config.custom_values_content:
+                actual_model_name = self._extract_model_name_from_custom_values(config.custom_values_content) or config.model_name
+                logger.info(f"🔄 Extracted model name from custom values: {actual_model_name}")
+            
             # Generate release name based on deployment config
-            release_name = self._generate_helm_release_name(config, deployment_id)
+            release_name = self._generate_helm_release_name(config, deployment_id, actual_model_name)
             namespace = getattr(config, 'namespace', 'vllm')
             
             # Create Helm values from vLLM config or use custom values
@@ -151,16 +157,57 @@ class VLLMManager:
         except Exception as e:
             logger.error(f"Failed to deploy vLLM with Helm: {e}")
             raise
+
+    def _extract_model_name_from_custom_values(self, custom_values_content: str) -> Optional[str]:
+        """Extract model name from custom values YAML content"""
+        try:
+            import yaml
+            values_data = yaml.safe_load(custom_values_content)
+            
+            # Try different possible paths for model name
+            possible_paths = [
+                ['vllm', 'vllm', 'model'],      # vllm.vllm.model
+                ['vllm', 'model'],              # vllm.model  
+                ['model'],                      # model
+                ['vllm', 'vllm', 'model_name'], # vllm.vllm.model_name
+                ['vllm', 'model_name'],         # vllm.model_name
+                ['model_name']                  # model_name
+            ]
+            
+            for path in possible_paths:
+                try:
+                    value = values_data
+                    for key in path:
+                        value = value[key]
+                    if value and isinstance(value, str):
+                        # Extract just the model name from path if it's a full path
+                        model_name = value.strip('/').split('/')[-1] if '/' in value else value
+                        logger.info(f"Found model in custom values at {'.'.join(path)}: {value} -> {model_name}")
+                        return model_name
+                except (KeyError, TypeError):
+                    continue
+                    
+            logger.warning("Could not extract model name from custom values")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to parse custom values for model name: {e}")
+            return None
     
-    def _generate_helm_release_name(self, config: VLLMConfig, deployment_id: str) -> str:
+    def _generate_helm_release_name(self, config: VLLMConfig, deployment_id: str, actual_model_name: Optional[str] = None) -> str:
         """Generate a Helm release name based on config and deployment ID"""
+        # Use actual model name if provided, otherwise fallback to config.model_name
+        model_name = actual_model_name or config.model_name
+        
         # Create a safe release name from model name and deployment ID
-        model_name = config.model_name.lower().replace('/', '-').replace('_', '-')
+        safe_model_name = model_name.lower().replace('/', '-').replace('_', '-')
         short_id = deployment_id[:8]  # Use first 8 chars of deployment ID
         gpu_type = "gpu" if config.gpu_resource_type != "cpu" else "cpu"
         gpu_count = config.gpu_resource_count
         
-        return f"vllm-{model_name}-{short_id}-{gpu_type}-{gpu_count}"
+        release_name = f"vllm-{safe_model_name}-{short_id}-{gpu_type}-{gpu_count}"
+        logger.info(f"🏷️ Generated release name: {release_name} (from model: {model_name})")
+        return release_name
     
     def _create_helm_values_from_config(self, config: VLLMConfig, deployment_id: str) -> Dict[str, Any]:
         """Convert VLLMConfig to Helm values"""
