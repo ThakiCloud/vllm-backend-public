@@ -56,6 +56,10 @@ async def startup_event():
     # Start queue monitoring for real-time pod status updates
     await deployer_manager.start_queue_monitoring()
     
+    # Start VLLM queue scheduler as background task
+    asyncio.create_task(vllm_queue_scheduler())
+    logger.info("VLLM queue scheduler started")
+    
     logger.info("Benchmark-deployer service started successfully")
 
 @app.on_event("shutdown")

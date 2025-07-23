@@ -1,6 +1,8 @@
 import logging
 import yaml
 import asyncio
+import tempfile
+import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 import uuid
@@ -842,6 +844,8 @@ class DeployerManager:
         """Get VLLM queue collection from database"""
         from database import get_database
         db = get_database()
+        if db is None:
+            raise Exception("Database is not available (MongoDB connection failed)")
         return db.vllm_deployment_queue
 
     # -----------------------------------------------------------------------------
@@ -1809,9 +1813,11 @@ class DeployerManager:
             logger.error(f"Failed to terminate queue request {queue_request_id}: {e}")
 
     async def _get_vllm_queue_collection(self):
-        """Get VLLM queue collection"""
+        """Get VLLM queue collection from database"""
         from database import get_database
         db = get_database()
+        if db is None:
+            raise Exception("Database is not available (MongoDB connection failed)")
         return db.vllm_deployment_queue
 
     async def start_queue_monitoring(self):
@@ -1871,7 +1877,10 @@ class DeployerManager:
                     await self._check_benchmark_job_status(queue_request_id, request)
                     
         except Exception as e:
-            logger.error(f"Error monitoring processing requests: {e}")
+            if "Database is not available" in str(e):
+                logger.debug("Skipping queue monitoring - MongoDB not available")
+            else:
+                logger.error(f"Error monitoring processing requests: {e}")
 
     async def _check_vllm_deployment_status(self, queue_request_id: str, deployment_id: str):
         """Check VLLM deployment status and update queue if failed"""
