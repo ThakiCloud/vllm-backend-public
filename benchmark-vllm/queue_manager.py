@@ -631,7 +631,7 @@ class QueueManager:
                     if not queue_doc["vllm_config"] or not queue_doc["vllm_config"].get("model_name"):
                         raise Exception("Invalid or empty VLLM configuration")
                     
-                    deployment_response = None  # Initialize to track if deployment was attempted
+                    deployment_response = None
                     try:
                         # Deploy VLLM using Helm chart
                         logger.info(f"Creating VLLMConfig from queue data for request {request_id}")
@@ -723,26 +723,33 @@ class QueueManager:
                         await self._save_queue_request_to_db(queue_doc)
                         raise Exception(f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {vllm_error}")
                     
-                    # Execute benchmark jobs if any (only if VLLM deployment succeeded or was skipped)
-                    if queue_doc["benchmark_configs"]:
-                        logger.info(f"VLLM is ready, starting benchmark jobs for request {request_id}")
-                        queue_doc["current_step"] = "benchmark_jobs"
-                        await self._update_queue_request_in_db(request_id, queue_doc)
-                        
-                        created_jobs = await self._execute_benchmark_jobs(
-                            queue_doc["benchmark_configs"],
-                            queue_doc["deployment_id"],  # Use deployment_id from queue_doc instead
-                            request_id  # Pass queue_request_id for job tracking
-                        )
-                        logger.info(f"Completed all benchmark jobs for request {request_id}")
+                # Execute benchmark jobs if any (both for skip_vllm_creation=True and normal VLLM deployment)
+                if queue_doc["benchmark_configs"]:
+                    if skip_vllm_creation:
+                        logger.info(f"🚨 [BENCHMARK-VLLM] ✅ VLLM creation was skipped, starting benchmark jobs for request {request_id}")
                     else:
-                        logger.info(f"No benchmark jobs configured for request {request_id}")
+                        logger.info(f"VLLM is ready, starting benchmark jobs for request {request_id}")
                     
-                    # Update status to completed
-                    queue_doc["status"] = "completed"
-                    queue_doc["completed_at"] = datetime.utcnow()
-                    queue_doc["current_step"] = "completed"
+                    queue_doc["current_step"] = "benchmark_jobs"
+                    await self._update_queue_request_in_db(request_id, queue_doc)
                     
+                    created_jobs = await self._execute_benchmark_jobs(
+                        queue_doc["benchmark_configs"],
+                        queue_doc["deployment_id"],  # Use deployment_id from queue_doc instead
+                        request_id  # Pass queue_request_id for job tracking
+                    )
+                    logger.info(f"Completed all benchmark jobs for request {request_id}")
+                else:
+                    logger.info(f"No benchmark jobs configured for request {request_id}")
+                
+                # Update status to completed
+                queue_doc["status"] = "completed"
+                queue_doc["completed_at"] = datetime.utcnow()
+                queue_doc["current_step"] = "completed"
+                
+                if skip_vllm_creation:
+                    logger.info(f"🚨 [BENCHMARK-VLLM] ✅ Successfully processed queue request {request_id} (VLLM creation skipped)")
+                else:
                     logger.info(f"Successfully processed regular queue request {request_id}")
                 
             except Exception as e:
@@ -1135,15 +1142,8 @@ class QueueManager:
             
             logger.info(f"🔍 [DB-LOAD] Loaded {pending_and_processing_count} requests with pending/processing status")
             
-            # Also check ALL requests in the collection for debugging
-            all_count = 0
-            logger.info(f"🔍 [DB-LOAD] Checking ALL requests in collection for debugging:")
-            async for queue_doc in collection.find():
-                all_count += 1
-                request_id = queue_doc["queue_request_id"]
-                status = queue_doc.get("status", "unknown")
-                logger.info(f"🔍 [DB-LOAD] ALL-CHECK: {request_id} -> status={status}")
-                
+            # Get total count for debugging
+            all_count = await collection.count_documents({})
             logger.info(f"🔍 [DB-LOAD] Total requests in collection: {all_count}")
             
         except Exception as e:
