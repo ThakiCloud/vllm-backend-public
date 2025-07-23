@@ -88,7 +88,17 @@ async def health_check():
 async def system_status():
     """Get system status."""
     deployments = await vllm_manager.list_deployments()
-    active_count = sum(1 for d in deployments.values() if d.get("status") == "running")
+    
+    # Count active deployments, handling both VLLMDeployment objects and dicts
+    active_count = 0
+    for d in deployments.values():
+        if hasattr(d, 'status'):
+            # It's a VLLMDeployment object
+            if d.status == "running":
+                active_count += 1
+        elif isinstance(d, dict) and d.get("status") == "running":
+            # It's a dict
+            active_count += 1
     
     return SystemStatus(
         service="benchmark-vllm",
@@ -156,17 +166,44 @@ async def get_deployment_status(deployment_id: str):
     if not deployment_info:
         raise HTTPException(status_code=404, detail="Deployment not found")
     
-    return VLLMStatusResponse(
-        deployment_id=deployment_id,
-        deployment_name=deployment_info["deployment_name"],
-        status=deployment_info["status"],
-        error_message=deployment_info.get("error_message")
-    )
+    # Handle both VLLMDeployment object and dict formats
+    if hasattr(deployment_info, 'dict'):
+        # It's a VLLMDeployment object
+        return VLLMStatusResponse(
+            deployment_id=deployment_id,
+            deployment_name=deployment_info.helm_release_name or deployment_id,  # Use helm_release_name as deployment_name
+            status=deployment_info.status,
+            error_message=deployment_info.error_message
+        )
+    else:
+        # It's already a dict (legacy format)
+        return VLLMStatusResponse(
+            deployment_id=deployment_id,
+            deployment_name=deployment_info.get("deployment_name", deployment_info.get("helm_release_name", deployment_id)),
+            status=deployment_info["status"],
+            error_message=deployment_info.get("error_message")
+        )
 
 @app.get("/deployments", response_model=Dict[str, Dict[str, Any]])
 async def list_deployments():
     """List all deployments."""
-    return await vllm_manager.list_deployments()
+    deployments = await vllm_manager.list_deployments()
+    
+    # Convert VLLMDeployment objects to dictionaries
+    result = {}
+    for deployment_id, deployment in deployments.items():
+        if hasattr(deployment, 'dict'):
+            # It's a Pydantic model, convert to dict
+            deployment_dict = deployment.dict()
+            # Ensure config is also converted to dict
+            if 'config' in deployment_dict and hasattr(deployment_dict['config'], 'dict'):
+                deployment_dict['config'] = deployment_dict['config'].dict()
+            result[deployment_id] = deployment_dict
+        else:
+            # It's already a dict
+            result[deployment_id] = deployment
+    
+    return result
 
 @app.delete("/deployments/{deployment_id}")
 async def stop_deployment(deployment_id: str):

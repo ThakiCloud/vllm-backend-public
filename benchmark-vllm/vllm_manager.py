@@ -672,5 +672,48 @@ class VLLMManager:
             logger.error(f"Error checking pod readiness for release {release_name}: {e}")
             return False
 
+    async def cleanup_failed_helm_deployment(self, deployment_id: str) -> bool:
+        """Clean up a failed Helm deployment by uninstalling the Helm release"""
+        try:
+            deployment = await self.get_deployment_status(deployment_id)
+            if not deployment or not deployment.helm_release_name:
+                logger.warning(f"Cannot cleanup deployment {deployment_id} - deployment not found or no Helm release name")
+                return False
+            
+            logger.info(f"🧹 Cleaning up failed Helm deployment: {deployment.helm_release_name}")
+            
+            # Execute Helm uninstall command
+            helm_cmd = [
+                "helm", "uninstall", deployment.helm_release_name,
+                "--namespace", deployment.namespace
+            ]
+            
+            logger.info(f"Executing Helm cleanup: {' '.join(helm_cmd)}")
+            
+            result = subprocess.run(
+                helm_cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            logger.info(f"✅ Helm cleanup successful: {result.stdout}")
+            
+            # Update deployment status
+            deployment.status = "cleaned_up"
+            deployment.updated_at = datetime.utcnow()
+            self.deployments[deployment_id] = deployment
+            await self._update_deployment_in_db(deployment)
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Helm cleanup failed: {e.stderr}")
+            # Don't raise exception - cleanup failure shouldn't stop the process
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error during Helm cleanup: {e}")
+            return False
+
 # Global instance
 vllm_manager = VLLMManager()

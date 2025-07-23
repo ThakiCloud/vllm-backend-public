@@ -607,6 +607,7 @@ class QueueManager:
                     if not queue_doc["vllm_config"] or not queue_doc["vllm_config"].get("model_name"):
                         raise Exception("Invalid or empty VLLM configuration")
                     
+                    deployment_response = None  # Initialize to track if deployment was attempted
                     try:
                         # Deploy VLLM using Helm chart
                         logger.info(f"Creating VLLMConfig from queue data for request {request_id}")
@@ -643,18 +644,30 @@ class QueueManager:
                         logger.info(f"VLLM deployment {deployment_response.deployment_id} is ready, proceeding with benchmark jobs")
                         
                     except Exception as vllm_error:
-                            # VLLM deployment failed - do NOT proceed with benchmark jobs
-                            logger.error(f"=== VLLM DEPLOYMENT FAILED for request {request_id} ===")
-                            logger.error(f"VLLM Error: {vllm_error}")
-                            logger.info(f"Skipping ALL benchmark jobs due to VLLM deployment failure")
-                            logger.info(f"This request will be marked as failed and no further processing will occur")
-                            
-                            # Mark the current step as VLLM failure
-                            queue_doc["current_step"] = "vllm_deployment_failed"
-                            queue_doc["error_message"] = f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {str(vllm_error)}"
-                            
-                            # Re-raise the exception to be caught by the outer try-catch
-                            raise Exception(f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {str(vllm_error)}")
+                        # VLLM deployment failed - do NOT proceed with benchmark jobs
+                        logger.error(f"=== VLLM DEPLOYMENT FAILED for request {request_id} ===")
+                        logger.error(f"VLLM Error: {vllm_error}")
+                        
+                        # Clean up failed deployment ONLY if deployment was actually attempted
+                        if deployment_response is not None:
+                            logger.info(f"🧹 Cleaning up failed VLLM deployment {deployment_response.deployment_id}")
+                            cleanup_success = await vllm_manager.cleanup_failed_helm_deployment(deployment_response.deployment_id)
+                            if cleanup_success:
+                                logger.info(f"✅ Successfully cleaned up failed deployment {deployment_response.deployment_id}")
+                            else:
+                                logger.warning(f"⚠️ Failed to clean up deployment {deployment_response.deployment_id} - manual cleanup may be required")
+                        else:
+                            logger.info(f"🚫 No cleanup needed - VLLM deployment was not attempted or failed before Helm install")
+                        
+                        logger.info(f"Skipping ALL benchmark jobs due to VLLM deployment failure")
+                        logger.info(f"This request will be marked as failed and no further processing will occur")
+                        
+                        # Mark the current step as VLLM failure
+                        queue_doc["current_step"] = "vllm_deployment_failed"
+                        queue_doc["error_message"] = f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {str(vllm_error)}"
+                        
+                        # Re-raise the exception to be caught by the outer try-catch
+                        raise Exception(f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {str(vllm_error)}")
                     
                     # Execute benchmark jobs if any (only if VLLM deployment succeeded or was skipped)
                     if queue_doc["benchmark_configs"]:
