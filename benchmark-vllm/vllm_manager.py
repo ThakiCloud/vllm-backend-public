@@ -40,12 +40,61 @@ class VLLMManager:
         self.core_v1 = None
         self.deployments: Dict[str, VLLMDeployment] = {}
         self.db = get_database()
+        
+        # Track last custom values and deployment for smart reuse
+        self.last_custom_values_hash: Optional[str] = None
+        self.last_custom_values_content: Optional[str] = None
+        self.last_deployment_info: Optional[Dict[str, str]] = None  # {deployment_id, release_name}
+        
         self._load_kubernetes_client()
         
     async def initialize(self):
         """Initialize the VLLM manager (async initialization if needed)"""
         logger.info("VLLMManager initialized successfully")
+        
+        # Load last custom values tracking from database
+        await self._load_last_custom_values_from_db()
+        
         return True
+
+    async def _load_last_custom_values_from_db(self):
+        """Load last custom values tracking from database"""
+        try:
+            collection = self.db.vllm_last_custom_values
+            doc = await collection.find_one({"_id": "last_custom_values"})
+            
+            if doc:
+                self.last_custom_values_hash = doc.get("hash")
+                self.last_custom_values_content = doc.get("content")
+                self.last_deployment_info = doc.get("deployment_info")
+                logger.info(f"💾 Loaded last custom values tracking from DB: {self.last_custom_values_hash}")
+            else:
+                logger.info("📋 No previous custom values tracking found in DB")
+                
+        except Exception as e:
+            logger.warning(f"Failed to load last custom values from DB: {e}")
+
+    async def _save_last_custom_values_to_db(self):
+        """Save last custom values tracking to database"""
+        try:
+            collection = self.db.vllm_last_custom_values
+            doc = {
+                "_id": "last_custom_values",
+                "hash": self.last_custom_values_hash,
+                "content": self.last_custom_values_content,
+                "deployment_info": self.last_deployment_info,
+                "updated_at": datetime.utcnow()
+            }
+            
+            await collection.replace_one(
+                {"_id": "last_custom_values"}, 
+                doc, 
+                upsert=True
+            )
+            logger.debug(f"💾 Saved last custom values tracking to DB")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save last custom values to DB: {e}")
         
     def _load_kubernetes_client(self):
         """Load Kubernetes client configuration"""
@@ -74,7 +123,7 @@ class VLLMManager:
             logger.warning(f"Could not list namespaces: {e}")
     
     async def deploy_vllm_with_helm(self, config: VLLMConfig, deployment_id: str, github_token: Optional[str] = None, repository_url: Optional[str] = None) -> VLLMDeploymentResponse:
-        """Deploy vLLM using Helm chart instead of hardcoded templates"""
+        """Deploy vLLM using Helm chart with smart custom values comparison and reuse"""
         try:
             logger.info(f"Starting Helm-based vLLM deployment: {deployment_id}")
             
@@ -84,8 +133,46 @@ class VLLMManager:
                 actual_model_name = self._extract_model_name_from_custom_values(config.custom_values_content) or config.model_name
                 logger.info(f"🔄 Extracted model name from custom values: {actual_model_name}")
             
-            # Generate release name based on deployment config
-            release_name = self._generate_helm_release_name(config, deployment_id, actual_model_name)
+            # Calculate custom values hash for comparison
+            current_values_hash = None
+            if config.custom_values_content:
+                import hashlib
+                current_values_hash = hashlib.md5(config.custom_values_content.encode()).hexdigest()
+                logger.info(f"📊 Current custom values hash: {current_values_hash}")
+                
+                # Check if we can reuse existing deployment
+                if (self.last_custom_values_hash == current_values_hash and 
+                    self.last_deployment_info is not None):
+                    
+                    logger.info(f"🎯 Custom values unchanged, reusing existing deployment: {self.last_deployment_info['deployment_id']}")
+                    
+                    # Return existing deployment info
+                    existing_deployment = await self.get_deployment_status(self.last_deployment_info['deployment_id'])
+                    if existing_deployment and existing_deployment.status in ["deploying", "running"]:
+                        logger.info(f"✅ Reusing existing deployment: {self.last_deployment_info['release_name']}")
+                        return VLLMDeploymentResponse(
+                            deployment_id=self.last_deployment_info['deployment_id'],
+                            deployment_name=self.last_deployment_info['release_name'],
+                            status=existing_deployment.status,
+                            config=config,
+                            created_at=existing_deployment.created_at,
+                            message=f"Reusing existing vLLM deployment: {self.last_deployment_info['release_name']}"
+                        )
+                
+                # Different custom values - cleanup existing deployment
+                if (self.last_custom_values_hash and 
+                    self.last_custom_values_hash != current_values_hash and 
+                    self.last_deployment_info is not None):
+                    
+                    logger.info(f"🔄 Custom values changed, cleaning up existing deployment: {self.last_deployment_info['release_name']}")
+                    cleanup_success = await self.cleanup_failed_helm_deployment(self.last_deployment_info['deployment_id'])
+                    if cleanup_success:
+                        logger.info(f"🧹 Successfully cleaned up previous deployment")
+                    else:
+                        logger.warning(f"⚠️ Failed to cleanup previous deployment - continuing with new deployment")
+            
+            # Generate deterministic release name based on custom values or config
+            release_name = self._generate_deterministic_release_name(config, actual_model_name, current_values_hash)
             namespace = getattr(config, 'namespace', 'vllm')
             
             # Create Helm values from vLLM config or use custom values
@@ -136,6 +223,19 @@ class VLLMManager:
                 
                 self.deployments[deployment_id] = deployment
                 await self._save_deployment_to_db(deployment)
+                
+                # Update last custom values tracking
+                if config.custom_values_content:
+                    self.last_custom_values_hash = current_values_hash
+                    self.last_custom_values_content = config.custom_values_content
+                    self.last_deployment_info = {
+                        'deployment_id': deployment_id,
+                        'release_name': release_name
+                    }
+                    logger.info(f"💾 Updated last custom values tracking: {current_values_hash}")
+                    
+                    # Save to database for persistence across restarts
+                    await self._save_last_custom_values_to_db()
                 
                 logger.info(f"Helm deployment started successfully: {release_name}")
                 return VLLMDeploymentResponse(
@@ -195,19 +295,28 @@ class VLLMManager:
             logger.warning(f"Failed to parse custom values for model name: {e}")
             return None
     
-    def _generate_helm_release_name(self, config: VLLMConfig, deployment_id: str, actual_model_name: Optional[str] = None) -> str:
-        """Generate a Helm release name based on config and deployment ID"""
+    def _generate_deterministic_release_name(self, config: VLLMConfig, actual_model_name: Optional[str] = None, current_values_hash: Optional[str] = None) -> str:
+        """Generate a deterministic release name based on config, model name, and custom values hash"""
         # Use actual model name if provided, otherwise fallback to config.model_name
         model_name = actual_model_name or config.model_name
         
-        # Create a safe release name from model name and deployment ID
+        # Create a safe release name from model name
         safe_model_name = model_name.lower().replace('/', '-').replace('_', '-')
-        short_id = deployment_id[:8]  # Use first 8 chars of deployment ID
         gpu_type = "gpu" if config.gpu_resource_type != "cpu" else "cpu"
         gpu_count = config.gpu_resource_count
         
-        release_name = f"vllm-{safe_model_name}-{short_id}-{gpu_type}-{gpu_count}"
-        logger.info(f"🏷️ Generated release name: {release_name} (from model: {model_name})")
+        # Use custom values hash as identifier if available
+        if current_values_hash:
+            identifier = current_values_hash[:8]  # Use first 8 chars of hash
+            release_name = f"vllm-{safe_model_name}-{identifier}-{gpu_type}-{gpu_count}"
+        else:
+            # Fallback: create deterministic hash from config
+            import hashlib
+            config_str = f"{model_name}-{gpu_type}-{gpu_count}-{config.served_model_name}"
+            config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+            release_name = f"vllm-{safe_model_name}-{config_hash}-{gpu_type}-{gpu_count}"
+            
+        logger.info(f"🏷️ Generated deterministic release name: {release_name} (from model: {model_name})")
         return release_name
     
     def _create_helm_values_from_config(self, config: VLLMConfig, deployment_id: str) -> Dict[str, Any]:
@@ -704,6 +813,16 @@ class VLLMManager:
             deployment.updated_at = datetime.utcnow()
             self.deployments[deployment_id] = deployment
             await self._update_deployment_in_db(deployment)
+            
+            # Clear last custom values tracking if this was the tracked deployment
+            if (self.last_deployment_info and 
+                self.last_deployment_info.get('deployment_id') == deployment_id):
+                
+                logger.info(f"🧹 Clearing last custom values tracking for cleaned up deployment")
+                self.last_custom_values_hash = None
+                self.last_custom_values_content = None
+                self.last_deployment_info = None
+                await self._save_last_custom_values_to_db()
             
             return True
             
