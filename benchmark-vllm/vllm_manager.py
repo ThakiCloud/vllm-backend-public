@@ -113,6 +113,7 @@ class VLLMManager:
             
             try:
                 # Deploy using Helm
+                logger.info(f"Deploying vLLM with Helm: {release_name}")
                 chart_path = self._get_vllm_chart_path(github_token, repository_url)
                 await self._helm_install(release_name, chart_path, namespace, values_file)
                 
