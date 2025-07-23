@@ -1121,11 +1121,31 @@ class QueueManager:
         try:
             db = get_database()
             collection = db.vllm_deployment_queue
+            
+            logger.info(f"🔍 [DB-LOAD] Loading queue requests from collection: vllm_deployment_queue")
+            
             # Load pending and processing requests
+            pending_and_processing_count = 0
             async for queue_doc in collection.find({"status": {"$in": ["pending", "processing"]}}):
                 request_id = queue_doc["queue_request_id"]
+                pending_and_processing_count += 1
+                logger.info(f"🔍 [DB-LOAD] Loading request {request_id} with status {queue_doc['status']}")
                 self.queue_requests[request_id] = queue_doc
                 logger.info(f"Loaded queue request {request_id} with status {queue_doc['status']}")
+            
+            logger.info(f"🔍 [DB-LOAD] Loaded {pending_and_processing_count} requests with pending/processing status")
+            
+            # Also check ALL requests in the collection for debugging
+            all_count = 0
+            logger.info(f"🔍 [DB-LOAD] Checking ALL requests in collection for debugging:")
+            async for queue_doc in collection.find():
+                all_count += 1
+                request_id = queue_doc["queue_request_id"]
+                status = queue_doc.get("status", "unknown")
+                logger.info(f"🔍 [DB-LOAD] ALL-CHECK: {request_id} -> status={status}")
+                
+            logger.info(f"🔍 [DB-LOAD] Total requests in collection: {all_count}")
+            
         except Exception as e:
             logger.error(f"Failed to load queue requests from database: {e}")
 

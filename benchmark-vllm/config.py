@@ -38,7 +38,7 @@ def get_default_mongo_url():
         return "mongodb://admin:password123@localhost:27017/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000"
 
 MONGO_URL = os.getenv("MONGO_URL", get_default_mongo_url())
-DATABASE_NAME = os.getenv("DATABASE_NAME", "benchmark_vllm")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "deploy_db")
 
 # vLLM configuration
 VLLM_CONFIG_DIR = os.getenv("VLLM_CONFIG_DIR", "./configs")
