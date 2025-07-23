@@ -943,7 +943,7 @@ class QueueManager:
                     logger.info(f"🔍 Checking if job was actually created despite API error...")
                     
                     # Check if job was actually created despite the API error
-                    job_exists = await self._check_if_job_exists(actual_job_name, namespace, deployer_base_url)
+                    job_exists, actual_job_name = await self._check_if_job_exists(actual_job_name, namespace, deployer_base_url, yaml_content)
                     if job_exists:
                         logger.info(f"✅ Job {actual_job_name} was created despite API error - continuing with monitoring")
                     else:
@@ -1045,11 +1045,15 @@ class QueueManager:
                 
                 return result
 
-    async def _check_if_job_exists(self, job_name: str, namespace: str, deployer_base_url: str) -> bool:
-        """Check if a job exists by trying to get its status"""
+    async def _check_if_job_exists(self, job_name: str, namespace: str, deployer_base_url: str, yaml_content: str = None) -> tuple[bool, str]:
+        """Check if a job exists by trying to get its status. Returns (exists, actual_job_name)"""
         try:
             # Wait a moment for the job to be created
             await asyncio.sleep(2)
+            
+            # First try with the provided job_name
+            actual_job_name = job_name
+            job_found = False
             
             async with aiohttp.ClientSession() as session:
                 status_url = f"{deployer_base_url}/jobs/{job_name}/status"
@@ -1060,19 +1064,51 @@ class QueueManager:
                         # Job exists and we can get its status
                         status_data = await response.json()
                         logger.info(f"🔍 Job {job_name} exists with status: {status_data.get('status', 'unknown')}")
-                        return True
+                        return True, job_name
                     elif response.status == 404:
-                        # Job doesn't exist
-                        logger.info(f"🔍 Job {job_name} not found - deployment failed")
-                        return False
+                        logger.info(f"🔍 Job {job_name} not found, checking for actual job name from YAML...")
+                        job_found = False
                     else:
-                        # Other error - assume job doesn't exist
+                        # Other error - try to extract actual name from YAML
                         logger.warning(f"🔍 Could not check job {job_name} status: HTTP {response.status}")
-                        return False
+                        job_found = False
+            
+            # If job not found with provided name, try to extract actual name from YAML
+            if not job_found and yaml_content:
+                try:
+                    import yaml
+                    yaml_docs = list(yaml.safe_load_all(yaml_content))
+                    
+                    for doc in yaml_docs:
+                        if doc and doc.get('kind', '').lower() == 'job':
+                            actual_job_name = doc.get('metadata', {}).get('name', job_name)
+                            logger.info(f"🔍 Found actual job name in YAML: {actual_job_name}")
+                            break
+                    
+                    # Try with the actual job name from YAML
+                    if actual_job_name != job_name:
+                        async with aiohttp.ClientSession() as session:
+                            status_url = f"{deployer_base_url}/jobs/{actual_job_name}/status"
+                            params = {"namespace": namespace}
+                            
+                            async with session.get(status_url, params=params) as response:
+                                if response.status == 200:
+                                    status_data = await response.json()
+                                    logger.info(f"🔍 Job {actual_job_name} (from YAML) exists with status: {status_data.get('status', 'unknown')}")
+                                    return True, actual_job_name
+                                else:
+                                    logger.info(f"🔍 Job {actual_job_name} (from YAML) not found either")
+                
+                except Exception as yaml_error:
+                    logger.warning(f"🔍 Error parsing YAML to find job name: {yaml_error}")
+            
+            # Job doesn't exist with either name
+            logger.info(f"🔍 Job not found with any name - deployment failed")
+            return False, actual_job_name
                         
         except Exception as e:
             logger.warning(f"🔍 Error checking if job {job_name} exists: {e}")
-            return False
+            return False, job_name
 
     async def _wait_for_job_completion(self, job_name: str, namespace: str, deployer_base_url: str, timeout: int = 3600, max_failures: int = 3):
         """Wait for job completion with failure tracking and retry logic"""
