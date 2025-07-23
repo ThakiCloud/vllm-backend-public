@@ -710,7 +710,7 @@ class QueueManager:
                         logger.info(f"This request will be marked as failed and no further processing will occur")
                         
                         # Save failed state and exit processing for this request
-                        await self._save_queue_request_to_db(request_id, queue_doc)
+                        await self._save_queue_request_to_db(queue_doc)
                         raise Exception(f"VLLM deployment failed after {VLLM_MAX_FAILURES} attempts: {vllm_error}")
                     
                     # Execute benchmark jobs if any (only if VLLM deployment succeeded or was skipped)
