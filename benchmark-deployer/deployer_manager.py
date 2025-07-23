@@ -1064,17 +1064,11 @@ class DeployerManager:
 
 
     async def deploy_vllm_with_helm(self, request: VLLMHelmDeploymentRequest) -> Dict[str, Any]:
+        """Deploy VLLM using Helm chart"""
         try:
-            import aiohttp
-            import tempfile
-            import os
-            import subprocess
-            import asyncio
-            
             # Check if VLLM creation should be skipped
             skip_vllm_creation = getattr(request, 'skip_vllm_creation', False)
             
-            # Debug logging
             logger.info(f"🚨 [DEPLOYER] =================================================")
             logger.info(f"🚨 [DEPLOYER] VLLM Helm Deployment Request Received")
             logger.info(f"🚨 [DEPLOYER] skip_vllm_creation flag = {skip_vllm_creation}")
@@ -1084,33 +1078,51 @@ class DeployerManager:
             logger.info(f"🚨 [DEPLOYER] =================================================")
             
             if skip_vllm_creation:
-                logger.info(f"🚨 [DEPLOYER] ✅ VLLM creation is SKIPPED - redirecting to queue for benchmark jobs only")
+                logger.info(f"🚨 [DEPLOYER] ✅ VLLM creation is SKIPPED - redirecting to benchmark-vllm queue")
                 
-                # Convert to queue request and process via queue
-                from models import VLLMDeploymentQueueRequest
-                queue_request = VLLMDeploymentQueueRequest(
-                    vllm_config=None,  # No config when skipping VLLM creation
-                    benchmark_configs=request.benchmark_configs or [],
-                    scheduling_config=request.scheduling_config or {},
-                    priority=request.priority,
-                    skip_vllm_creation=True
-                )
+                # Use benchmark-vllm API to add to queue instead of local database
+                import aiohttp
+                from config import BENCHMARK_VLLM_URL
                 
-                logger.info(f"🚨 [DEPLOYER] ✅ Created queue_request with skip_vllm_creation=True")
-                logger.info(f"🚨 [DEPLOYER] ✅ queue_request.skip_vllm_creation = {queue_request.skip_vllm_creation}")
-                
-                # Add to queue instead of deploying
-                queue_response = await self.add_vllm_to_queue(queue_request)
-                
-                logger.info(f"🚨 [DEPLOYER] ✅ Added to queue with ID: {queue_response.queue_request_id}")
-                
-                return {
-                    "status": "success",
-                    "message": f"Benchmark jobs added to queue (VLLM creation skipped)",
-                    "deployment_id": "skipped-vllm",
-                    "queue_request_id": queue_response.queue_request_id,
-                    "action": "queued"
+                # Prepare queue request data compatible with benchmark-vllm QueueRequest model
+                queue_request_data = {
+                    "vllm_config": None,  # No config when skipping VLLM creation
+                    "benchmark_configs": [
+                        config.dict() if hasattr(config, 'dict') else config 
+                        for config in (request.benchmark_configs or [])
+                    ],
+                    "scheduling_config": request.scheduling_config.dict() if request.scheduling_config and hasattr(request.scheduling_config, 'dict') else (request.scheduling_config or {
+                        "immediate": True,
+                        "scheduled_time": None,
+                        "max_wait_time": 3600
+                    }),
+                    "priority": request.priority,
+                    "vllm_yaml_content": None,
+                    "skip_vllm_creation": True  # Critical flag
                 }
+                
+                logger.info(f"🚨 [DEPLOYER] ✅ Sending queue request to benchmark-vllm API")
+                logger.info(f"🚨 [DEPLOYER] ✅ queue_request_data['skip_vllm_creation'] = {queue_request_data['skip_vllm_creation']}")
+                
+                async with aiohttp.ClientSession() as session:
+                    queue_url = f"{BENCHMARK_VLLM_URL}/queue/deployment"
+                    async with session.post(queue_url, json=queue_request_data) as response:
+                        if response.status == 200:
+                            queue_response = await response.json()
+                            queue_request_id = queue_response.get('queue_request_id')
+                            logger.info(f"🚨 [DEPLOYER] ✅ Successfully added to benchmark-vllm queue: {queue_request_id}")
+                            
+                            return {
+                                "status": "success",
+                                "message": f"Benchmark jobs added to queue (VLLM creation skipped)",
+                                "deployment_id": "skipped-vllm",
+                                "queue_request_id": queue_request_id,
+                                "action": "queued"
+                            }
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"🚨 [DEPLOYER] ❌ Failed to add to benchmark-vllm queue: {response.status} - {error_text}")
+                            raise Exception(f"Failed to add to benchmark-vllm queue: {response.status} - {error_text}")
             
             logger.info(f"🚨 [DEPLOYER] ❌ VLLM creation is NOT SKIPPED - proceeding with Helm deployment")
             logger.info(f"Starting VLLM Helm deployment: {request.vllm_helm_config.release_name}")
