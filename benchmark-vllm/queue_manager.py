@@ -580,17 +580,17 @@ class QueueManager:
             await self._update_queue_request_in_db(request_id, queue_doc)
             
             try:
-                # Check if this is a Helm deployment
-                if queue_doc.get("helm_deployment", False):
-                    # For Helm deployments, we don't deploy VLLM directly
-                    # The deployment is handled by the benchmark-deployer service
-                    logger.info(f"Skipping Helm deployment queue request {request_id} - handled by benchmark-deployer")
-                    
-                    # Don't change status here - let benchmark-deployer update it
-                    # Just continue to the next request
-                    return
-                    
+                # Process both regular and Helm deployment requests
+                # (deployer now only registers requests in queue, benchmark-vllm handles all deployments)
+                
+                # Check if this is a Helm deployment (now processed by benchmark-vllm)
+                is_helm_deployment = queue_doc.get("helm_deployment", False)
+                if is_helm_deployment:
+                    logger.info(f"Processing Helm deployment queue request {request_id} (registered by deployer)")
                 else:
+                    logger.info(f"Processing regular queue request {request_id}")
+                
+                # Unified processing logic for both regular and Helm deployments:
                     # Check if VLLM creation should be skipped
                     skip_vllm_creation = queue_doc.get("skip_vllm_creation", False)
                     
