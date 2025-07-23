@@ -1195,7 +1195,13 @@ class DeployerManager:
                             logger.info(f"Retrieved repository URL: {repository_url}")
             
             # Add custom values to vllm_config if available
-            vllm_config_dict = request.vllm_config.dict() if request.vllm_config else {}
+            if request.vllm_config:
+                if hasattr(request.vllm_config, 'dict'):
+                    vllm_config_dict = request.vllm_config.dict()
+                else:
+                    vllm_config_dict = request.vllm_config
+            else:
+                vllm_config_dict = {}
             if values_content:
                 vllm_config_dict["custom_values_content"] = values_content
                 logger.info(f"Added custom values content to VLLM config for queue (size: {len(values_content)} chars)")
@@ -1213,7 +1219,7 @@ class DeployerManager:
                 "vllm_yaml_content": None,
                 # Add Helm-specific metadata
                 "helm_deployment": True,
-                "helm_config": request.vllm_helm_config.dict(),
+                "helm_config": request.vllm_helm_config.dict() if hasattr(request.vllm_helm_config, 'dict') else request.vllm_helm_config,
                 # Add GitHub token for private repository access
                 "github_token": github_token,
                 # Add repository URL for charts cloning
