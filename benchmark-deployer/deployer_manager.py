@@ -1151,6 +1151,29 @@ class DeployerManager:
             logger.error(f"VLLM Helm deployment failed: {e}")
             raise Exception(f"VLLM Helm deployment failed: {str(e)}")
 
+    async def _get_values_file_content(self, project_id: str, values_file_id: str, github_token: str = None) -> str:
+        """Get custom values file content from manager API"""
+        try:
+            import aiohttp
+            from config import BENCHMARK_MANAGER_URL
+            
+            logger.info(f"Fetching custom values file: {values_file_id} from project: {project_id}")
+            
+            async with aiohttp.ClientSession() as session:
+                file_url = f"{BENCHMARK_MANAGER_URL}/projects/{project_id}/files/{values_file_id}"
+                async with session.get(file_url) as response:
+                    if response.status == 200:
+                        file_data = await response.json()
+                        values_content = file_data.get('file', {}).get('content', '')
+                        logger.info(f"Retrieved custom values file content: {len(values_content)} characters")
+                        return values_content
+                    else:
+                        logger.warning(f"Failed to fetch custom values file: {response.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error fetching custom values file: {e}")
+            return None
+
     async def _register_helm_deployment_in_queue(self, request: VLLMHelmDeploymentRequest, github_token: str = None, values_content: str = None):
         """Register Helm deployment request in the benchmark-vllm queue for visibility"""
         try:
