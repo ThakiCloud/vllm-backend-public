@@ -1146,6 +1146,9 @@ class DeployerManager:
                         else:
                             logger.warning(f"Failed to fetch project information: {response.status}")
             
+            # First, register this Helm deployment request in the benchmark-vllm queue
+            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token, values_content)
+            
             # Get custom values file content if specified (GitHub token already retrieved above)
             values_content = None
             if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
@@ -1154,9 +1157,19 @@ class DeployerManager:
                     request.vllm_helm_config.values_file_id,
                     github_token
                 )
-            
-            # First, register this Helm deployment request in the benchmark-vllm queue
-            queue_request_id = await self._register_helm_deployment_in_queue(request, github_token, values_content)
+            if request.vllm_helm_config.project_id and request.vllm_helm_config.values_file_id:
+                logger.info(f"Fetching custom values file: {request.vllm_helm_config.values_file_id}")
+                
+                from config import BENCHMARK_MANAGER_URL
+                async with aiohttp.ClientSession() as session:
+                    file_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.vllm_helm_config.project_id}/files/{request.vllm_helm_config.values_file_id}"
+                    async with session.get(file_url) as response:
+                        if response.status == 200:
+                            file_data = await response.json()
+                            values_content = file_data.get('file', {}).get('content', '')
+                            logger.info(f"Retrieved custom values file content: {len(values_content)} characters")
+                        else:
+                            logger.warning(f"Failed to fetch custom values file: {response.status}")
             
             # Create temporary values file
             values_file_path = None
@@ -1167,200 +1180,16 @@ class DeployerManager:
                     logger.info(f"Created temporary values file: {values_file_path}")
             
             try:
-                # Ensure we have the latest charts from GitHub
-                chart_base_dir = await self._ensure_latest_charts()
+                # deployer는 Helm 배포를 하지 않고 benchmark-vllm 큐에 요청만 등록
+                logger.info("Helm deployment request registered in benchmark-vllm queue. Actual deployment will be handled by benchmark-vllm service.")
                 
-                # Resolve chart path - the chart_path from request might be incorrect
-                # For VLLM deployments, we need to use a standard chart location
-                requested_chart_path = request.vllm_helm_config.chart_path
-                logger.info(f"Requested chart path: {requested_chart_path}")
-                
-                # For VLLM Helm deployments, use a remote chart or local chart
-                # Try to find the correct chart path
-                possible_chart_paths = [
-                    # Try the requested path first
-                    requested_chart_path,
-                ]
-                
-                # Add GitHub cloned chart path if available
-                if chart_base_dir:
-                    possible_chart_paths.extend([
-                        f"{chart_base_dir}/thaki/vllm/charts/vllm",
-                        f"{chart_base_dir}/thaki/vllm",
-                    ])
-                
-                # Add fallback paths
-                possible_chart_paths.extend([
-                    # Try common local locations with correct structure
-                    "./charts/thaki/vllm/charts/vllm",
-                    "../charts/thaki/vllm/charts/vllm",
-                    "./charts/vllm",
-                    "../benchmark-vllm-helm/charts/thaki/vllm/charts/vllm", 
-                    "../benchmark-vllm-helm/charts/thaki/vllm", 
-                    # Try absolute paths that might be mounted in containers
-                    "/charts/thaki/vllm/charts/vllm",
-                    "/charts/vllm",
-                    "/thaki/vllm",
-                    # Try relative paths
-                    "./vllm",
-                    "../vllm"
-                ])
-                
-                chart_path = None
-                for possible_path in possible_chart_paths:
-                    if os.path.exists(possible_path) and os.path.exists(os.path.join(possible_path, "Chart.yaml")):
-                        chart_path = possible_path
-                        logger.info(f"Found valid chart at: {chart_path}")
-                        break
-                
-                # If no local chart found, try to use a remote chart
-                if not chart_path:
-                    logger.error(f"No local chart found and GitHub clone failed. Cannot proceed with Helm deployment.")
-                    raise Exception("Unable to find VLLM Helm chart. GitHub clone failed and no local charts available.")
-                
-                logger.info(f"Final chart path: {chart_path}")
-                
-                # Check if release already exists and compare configurations
-                should_upgrade = await self._should_upgrade_helm_release(request)
-                
-                if should_upgrade == "upgrade":
-                    # Use uninstall/install instead of upgrade to avoid CRD issues
-                    await self._uninstall_helm_release(request.vllm_helm_config.release_name, request.vllm_helm_config.namespace)
-                    helm_cmd = [
-                        "helm", "install", request.vllm_helm_config.release_name,
-                        chart_path,
-                        "--namespace", request.vllm_helm_config.namespace,
-                        "--create-namespace"
-                    ]
-                    logger.info(f"Uninstalling and reinstalling Helm release: {request.vllm_helm_config.release_name}")
-                elif should_upgrade == "reinstall":
-                    # Uninstall existing release and install new one
-                    await self._uninstall_helm_release(request.vllm_helm_config.release_name, request.vllm_helm_config.namespace)
-                    helm_cmd = [
-                        "helm", "install", request.vllm_helm_config.release_name,
-                        chart_path,
-                        "--namespace", request.vllm_helm_config.namespace,
-                        "--create-namespace"
-                    ]
-                    logger.info(f"Reinstalling Helm release: {request.vllm_helm_config.release_name}")
-                elif should_upgrade == "skip":
-                    # Same configuration, skip deployment
-                    logger.info(f"Skipping deployment - same configuration already exists: {request.vllm_helm_config.release_name}")
-                    
-                    # Update queue status to completed with skip action
-                    if queue_request_id:
-                        await self._update_queue_status(queue_request_id, "skipped", "skipped-same-config")
-                    
-                    return {
-                        "status": "success",
-                        "message": f"VLLM Helm deployment skipped - same configuration already exists: {request.vllm_helm_config.release_name}",
-                        "deployment_id": "skipped",
-                        "release_name": request.vllm_helm_config.release_name,
-                        "namespace": request.vllm_helm_config.namespace,
-                        "action": "skipped"
-                    }
-                else:
-                    # New installation
-                    helm_cmd = [
-                        "helm", "install", request.vllm_helm_config.release_name,
-                        chart_path,
-                        "--namespace", request.vllm_helm_config.namespace,
-                        "--create-namespace"
-                    ]
-                    logger.info(f"Installing new Helm release: {request.vllm_helm_config.release_name}")
-                
-                # Add custom values file if available
-                if values_file_path:
-                    helm_cmd.extend(["-f", values_file_path])
-                
-                # Add additional arguments if specified
-                if request.vllm_helm_config.additional_args:
-                    additional_args = request.vllm_helm_config.additional_args.split()
-                    helm_cmd.extend(additional_args)
-                
-                logger.info(f"Executing Helm command: {' '.join(helm_cmd)}")
-                
-                # Execute Helm install
-                result = await asyncio.create_subprocess_exec(
-                    *helm_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                stdout, stderr = await result.communicate()
-                
-                if result.returncode == 0:
-                    logger.info(f"Helm deployment successful: {request.vllm_helm_config.release_name}")
-                    
-                    # Store deployment info in database
-                    deployment_id = str(uuid.uuid4())
-                    deployment_doc = {
-                        "deployment_id": deployment_id,
-                        "resource_name": request.vllm_helm_config.release_name,
-                        "resource_type": "helm_release",
-                        "namespace": request.vllm_helm_config.namespace,
-                        "helm_config": request.vllm_helm_config.dict(),
-                        "vllm_config": request.vllm_config,
-                        "created_at": datetime.now(),
-                        "status": "deployed",
-                        "helm_output": stdout.decode()
-                    }
-                    
-                    deployments_collection = get_deployments_collection()
-                    await deployments_collection.insert_one(deployment_doc)
-                    
-                    # Always wait for VLLM to be ready, even without benchmark jobs
-                    logger.info("Waiting for VLLM service to be ready...")
-                    try:
-                        await self._wait_for_vllm_ready(
-                            release_name=request.vllm_helm_config.release_name,
-                            namespace=request.vllm_helm_config.namespace,
-                            timeout=600  # 10 minutes timeout
-                        )
-                        logger.info("VLLM service is ready")
-                        
-                        # Execute benchmark jobs if any
-                        if request.benchmark_configs:
-                            logger.info("Executing benchmark jobs...")
-                            await self._execute_helm_benchmark_jobs(request.benchmark_configs, deployment_id)
-                            logger.info("All benchmark jobs completed successfully")
-                        
-                        # Update queue status to completed only after everything succeeds
-                        if queue_request_id:
-                            await self._update_queue_status(queue_request_id, "completed", deployment_id)
-                            
-                    except Exception as e:
-                        logger.error(f"VLLM readiness check or benchmark jobs failed: {e}")
-                        # Update queue status to failed
-                        if queue_request_id:
-                            await self._update_queue_status(queue_request_id, "failed", deployment_id, f"VLLM readiness or benchmark jobs failed: {str(e)}")
-                        
-                        # Clean up failed deployment
-                        try:
-                            await self._uninstall_helm_release(request.vllm_helm_config.release_name, request.vllm_helm_config.namespace)
-                            logger.info(f"Cleaned up failed deployment: {request.vllm_helm_config.release_name}")
-                        except Exception as cleanup_error:
-                            logger.warning(f"Failed to clean up deployment: {cleanup_error}")
-                        
-                        raise Exception(f"VLLM deployment failed: {str(e)}")
-                    
-                    return {
-                        "status": "success",
-                        "message": f"VLLM Helm deployment successful: {request.vllm_helm_config.release_name}",
-                        "deployment_id": deployment_id,
-                        "release_name": request.vllm_helm_config.release_name,
-                        "namespace": request.vllm_helm_config.namespace,
-                        "helm_output": stdout.decode(),
-                        "action": should_upgrade
-                    }
-                else:
-                    error_msg = stderr.decode()
-                    logger.error(f"Helm deployment failed: {error_msg}")
-                    
-                    # Update queue status to failed
-                    if queue_request_id:
-                        await self._update_queue_status(queue_request_id, "failed", None, error_msg)
-                    
-                    raise Exception(f"Helm deployment failed: {error_msg}")
+                return {
+                    "status": "success", 
+                    "message": "VLLM Helm deployment request registered in queue successfully",
+                    "deployment_id": "queued",
+                    "queue_request_id": queue_request_id,
+                    "action": "queued"
+                }
                     
             finally:
                 # Clean up temporary values file
@@ -1434,43 +1263,6 @@ class DeployerManager:
             logger.warning(f"Failed to register Helm deployment in queue: {e}")
             # Don't fail the deployment if queue registration fails
             return None
-
-    async def _get_values_file_content(self, project_id: str, values_file_id: str, github_token: str = None) -> str:
-        """Get custom values file content from manager API"""
-        try:
-            import aiohttp
-            from config import BENCHMARK_MANAGER_URL
-            
-            logger.info(f"Fetching custom values file: {values_file_id} from project: {project_id}")
-            
-            async with aiohttp.ClientSession() as session:
-                file_url = f"{BENCHMARK_MANAGER_URL}/projects/{project_id}/files/{values_file_id}"
-                headers = {}
-                if github_token:
-                    headers["Authorization"] = f"Bearer {github_token}"
-                
-                async with session.get(file_url, headers=headers) as response:
-                    if response.status == 200:
-                        file_data = await response.json()
-                        
-                        # Handle different response formats
-                        if 'file' in file_data:
-                            content = file_data['file'].get('content', '')
-                        elif 'content' in file_data:
-                            content = file_data['content']
-                        else:
-                            content = str(file_data)
-                            
-                        logger.info(f"Retrieved custom values file content: {len(content)} characters")
-                        return content
-                    else:
-                        error_text = await response.text()
-                        logger.warning(f"Failed to fetch custom values file: {response.status} - {error_text}")
-                        return ""
-                        
-        except Exception as e:
-            logger.warning(f"Error fetching custom values file: {e}")
-            return ""
 
     async def _should_upgrade_helm_release(self, request: VLLMHelmDeploymentRequest) -> str:
         """
