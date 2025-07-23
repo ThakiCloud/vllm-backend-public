@@ -1209,12 +1209,15 @@ class DeployerManager:
             # Prepare queue request data compatible with benchmark-vllm QueueRequest model
             queue_request_data = {
                 "vllm_config": vllm_config_dict,
-                "benchmark_configs": request.benchmark_configs or [],
-                "scheduling_config": request.scheduling_config or {
+                "benchmark_configs": [
+                    config.dict() if hasattr(config, 'dict') else config 
+                    for config in (request.benchmark_configs or [])
+                ],
+                "scheduling_config": request.scheduling_config.dict() if request.scheduling_config and hasattr(request.scheduling_config, 'dict') else (request.scheduling_config or {
                     "immediate": True,
                     "scheduled_time": None,
                     "max_wait_time": 3600
-                },
+                }),
                 "priority": request.priority,
                 "vllm_yaml_content": None,
                 # Add Helm-specific metadata
@@ -1239,7 +1242,9 @@ class DeployerManager:
                         return None
                         
         except Exception as e:
+            import traceback
             logger.warning(f"Failed to register Helm deployment in queue: {e}")
+            logger.warning(f"Full traceback: {traceback.format_exc()}")
             # Don't fail the deployment if queue registration fails
             return None
 
