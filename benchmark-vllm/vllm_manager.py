@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import os
 import yaml
+import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from kubernetes import client, config
@@ -144,20 +145,41 @@ class VLLMManager:
                 if (self.last_custom_values_hash == current_values_hash and 
                     self.last_deployment_info is not None):
                     
-                    logger.info(f"🎯 Custom values unchanged, reusing existing deployment: {self.last_deployment_info['deployment_id']}")
+                    logger.info(f"🎯 Custom values unchanged, checking if existing deployment can be reused: {self.last_deployment_info['deployment_id']}")
                     
-                    # Return existing deployment info
-                    existing_deployment = await self.get_deployment_status(self.last_deployment_info['deployment_id'])
-                    if existing_deployment and existing_deployment.status in ["deploying", "running"]:
+                    # Use smart reuse logic that checks actual Kubernetes/Helm status
+                    can_reuse = await self._can_reuse_existing_deployment(
+                        self.last_deployment_info['release_name'], 
+                        namespace
+                    )
+                    
+                    if can_reuse:
                         logger.info(f"✅ Reusing existing deployment: {self.last_deployment_info['release_name']}")
-                        return VLLMDeploymentResponse(
-                            deployment_id=self.last_deployment_info['deployment_id'],
-                            deployment_name=self.last_deployment_info['release_name'],
-                            status=existing_deployment.status,
+                        
+                        # Create a new deployment record for this request (but reuse the actual VLLM)
+                        deployment = VLLMDeployment(
+                            deployment_id=deployment_id,
                             config=config,
-                            created_at=existing_deployment.created_at,
-                            message=f"Reusing existing vLLM deployment: {self.last_deployment_info['release_name']}"
+                            status="running",  # We validated it's running
+                            helm_release_name=self.last_deployment_info['release_name'],
+                            namespace=namespace,
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow()
                         )
+                        
+                        self.deployments[deployment_id] = deployment
+                        await self._save_deployment_to_db(deployment)
+                        
+                        return VLLMDeploymentResponse(
+                            deployment_id=deployment_id,  # NEW deployment_id for this request
+                            deployment_name=self.last_deployment_info['release_name'],
+                            status="running",
+                            config=config,
+                            created_at=deployment.created_at,
+                            message=f"🔄 Reusing existing vLLM deployment: {self.last_deployment_info['release_name']}"
+                        )
+                    else:
+                        logger.info(f"❌ Cannot reuse existing deployment - will deploy new one")
                 
                 # Different custom values - cleanup existing deployment
                 if (self.last_custom_values_hash and 
@@ -732,7 +754,6 @@ class VLLMManager:
                 check=True
             )
             
-            import json
             status_data = json.loads(result.stdout)
             return {
                 'status': status_data.get('info', {}).get('status', 'unknown'),
@@ -832,6 +853,64 @@ class VLLMManager:
             return False
         except Exception as e:
             logger.error(f"❌ Error during Helm cleanup: {e}")
+            return False
+
+    async def _can_reuse_existing_deployment(self, release_name: str, namespace: str) -> bool:
+        """Check if existing Helm deployment can be reused by verifying actual status"""
+        try:
+            # Check 1: Helm release status
+            logger.info(f"🔍 Checking Helm release status: {release_name}")
+            helm_cmd = ["helm", "status", release_name, "--namespace", namespace, "--output", "json"]
+            
+            result = subprocess.run(
+                helm_cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            helm_status = json.loads(result.stdout)
+            release_status = helm_status.get("info", {}).get("status", "").lower()
+            
+            logger.info(f"📊 Helm release status: {release_status}")
+            
+            # Only reuse if Helm release is deployed
+            if release_status != "deployed":
+                logger.info(f"❌ Cannot reuse: Helm release status is '{release_status}', not 'deployed'")
+                return False
+            
+            # Check 2: Kubernetes deployment status
+            deployment_name = release_name  # Assuming deployment name matches release name
+            logger.info(f"🔍 Checking Kubernetes deployment: {deployment_name}")
+            
+            try:
+                deployment = self.apps_v1.read_namespaced_deployment(
+                    name=deployment_name,
+                    namespace=namespace
+                )
+                
+                # Check if deployment has ready replicas
+                ready_replicas = deployment.status.ready_replicas or 0
+                desired_replicas = deployment.spec.replicas or 0
+                
+                logger.info(f"📊 Kubernetes deployment status: {ready_replicas}/{desired_replicas} replicas ready")
+                
+                if ready_replicas > 0 and ready_replicas == desired_replicas:
+                    logger.info(f"✅ Deployment is healthy and can be reused")
+                    return True
+                else:
+                    logger.info(f"❌ Cannot reuse: Deployment not fully ready ({ready_replicas}/{desired_replicas})")
+                    return False
+                    
+            except Exception as k8s_error:
+                logger.warning(f"⚠️ Failed to check Kubernetes deployment: {k8s_error}")
+                return False
+                
+        except subprocess.CalledProcessError as e:
+            logger.info(f"❌ Cannot reuse: Helm release not found or failed: {e.stderr}")
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️ Error checking deployment reusability: {e}")
             return False
 
 # Global instance
