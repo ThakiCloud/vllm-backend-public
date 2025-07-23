@@ -1089,7 +1089,7 @@ class QueueManager:
         """Save queue request to database"""
         try:
             db = get_database()
-            collection = db.deployment_queue
+            collection = db.vllm_deployment_queue
             await collection.insert_one(queue_doc)
         except Exception as e:
             logger.error(f"Failed to save queue request to database: {e}")
@@ -1098,7 +1098,7 @@ class QueueManager:
         """Update queue request in database"""
         try:
             db = get_database()
-            collection = db.deployment_queue
+            collection = db.vllm_deployment_queue
             await collection.update_one(
                 {"queue_request_id": queue_request_id},
                 {"$set": queue_doc}
@@ -1107,19 +1107,15 @@ class QueueManager:
             logger.error(f"Failed to update queue request in database: {e}")
 
     async def _load_queue_requests_from_db(self):
-        """Load queue requests from database"""
+        """Load existing queue requests from database"""
         try:
             db = get_database()
-            collection = db.deployment_queue
-            
-            async for queue_doc in collection.find():
+            collection = db.vllm_deployment_queue
+            # Load pending and processing requests
+            async for queue_doc in collection.find({"status": {"$in": ["pending", "processing"]}}):
                 request_id = queue_doc["queue_request_id"]
-                # Remove MongoDB ObjectId
-                if "_id" in queue_doc:
-                    del queue_doc["_id"]
-                # Always update from database to ensure consistency
                 self.queue_requests[request_id] = queue_doc
-                    
+                logger.info(f"Loaded queue request {request_id} with status {queue_doc['status']}")
         except Exception as e:
             logger.error(f"Failed to load queue requests from database: {e}")
 
@@ -1127,7 +1123,7 @@ class QueueManager:
         """Delete queue request from database"""
         try:
             db = get_database()
-            collection = db.deployment_queue
+            collection = db.vllm_deployment_queue
             await collection.delete_one({"queue_request_id": queue_request_id})
         except Exception as e:
             logger.error(f"Failed to delete queue request from database: {e}")
