@@ -10,8 +10,8 @@ from uuid import uuid4
 class ProjectCreate(BaseModel):
     name: str = Field(..., description="Project name")
     project_type: Optional[str] = Field("benchmark", description="Project type: benchmark or vllm")
-    repository_url: str = Field(..., description="GitHub repository URL (e.g., https://api.github.com/repos/owner/repo)")
-    github_token: str = Field(..., description="GitHub personal access token")
+    repository_url: Optional[str] = Field("", description="GitHub repository URL (e.g., https://api.github.com/repos/owner/repo) - leave empty for local project")
+    github_token: Optional[str] = Field("", description="GitHub personal access token - leave empty for local project")
     config_path: Optional[str] = Field("config", description="Config folder path in repository")
     job_path: Optional[str] = Field("job", description="Job folder path in repository")
     vllm_values_path: Optional[str] = Field("", description="VLLM values files path in repository")
@@ -31,8 +31,8 @@ class Project(BaseModel):
     project_id: str
     name: str
     project_type: Optional[str] = "benchmark"
-    repository_url: str
-    github_token: str
+    repository_url: Optional[str] = ""
+    github_token: Optional[str] = ""
     config_path: str
     job_path: str
     vllm_values_path: Optional[str] = ""

@@ -180,7 +180,7 @@ async def sync_project_files(project_id: str) -> SyncResponse:
             synced_files=0,
             project_id=project_id
         )
-    
+        
     try:
         github_client = create_github_client(project.repository_url, project.github_token)
         
@@ -193,14 +193,36 @@ async def sync_project_files(project_id: str) -> SyncResponse:
             all_files = await github_client.fetch_all_files(project.config_path, project.job_path)
         
         files_collection = get_original_files_collection()
+        
+        # 기존 파일들을 file_path를 키로 하는 딕셔너리로 조회
+        existing_files = {}
+        existing_cursor = files_collection.find({"project_id": project_id})
+        async for doc in existing_cursor:
+            existing_files[doc["file_path"]] = doc
+        
         synced_count = 0
+        updated_count = 0
+        new_count = 0
+        
+        # GitHub에서 가져온 파일 경로들을 추적
+        github_file_paths = set()
         
         for file_data in all_files:
-            file_id = str(uuid4())
+            file_path = file_data["file_path"]
+            github_file_paths.add(file_path)
+            
+            # 기존 파일이 있으면 기존 file_id 사용, 없으면 새 file_id 생성
+            if file_path in existing_files:
+                file_id = existing_files[file_path]["file_id"]
+                updated_count += 1
+            else:
+                file_id = str(uuid4())
+                new_count += 1
+            
             file_doc = {
                 "file_id": file_id,
                 "project_id": project_id,
-                "file_path": file_data["file_path"],
+                "file_path": file_path,
                 "file_type": file_data["file_type"],
                 "content": file_data["content"],
                 "sha": file_data["sha"],
@@ -211,12 +233,22 @@ async def sync_project_files(project_id: str) -> SyncResponse:
             await files_collection.update_one(
                 {
                     "project_id": project_id,
-                    "file_path": file_data["file_path"]
+                    "file_path": file_path
                 },
                 {"$set": file_doc},
                 upsert=True
             )
             synced_count += 1
+        
+        # GitHub에 없는 기존 파일들 삭제
+        deleted_count = 0
+        for existing_path in existing_files.keys():
+            if existing_path not in github_file_paths:
+                await files_collection.delete_one({
+                    "project_id": project_id,
+                    "file_path": existing_path
+                })
+                deleted_count += 1
         
         projects_collection = get_projects_collection()
         await projects_collection.update_one(
@@ -224,11 +256,11 @@ async def sync_project_files(project_id: str) -> SyncResponse:
             {"$set": {"last_sync": datetime.now()}}
         )
         
-        logging.info(f"Synced {synced_count} files for project {project_id}")
+        logging.info(f"Synced {synced_count} files for project {project_id}: {new_count} new, {updated_count} updated, {deleted_count} deleted")
         
         return SyncResponse(
             status="success",
-            message=f"Successfully synced {synced_count} files",
+            message=f"Successfully synced {synced_count} files ({new_count} new, {updated_count} updated, {deleted_count} deleted)",
             synced_files=synced_count,
             project_id=project_id
         )
