@@ -134,6 +134,13 @@ async def get_all_project_files(project_id: str):
     async for doc in original_cursor:
         file_data = dict(doc)
         file_data["source"] = "original"  # Mark as original file
+        
+        # file_path에서 benchmark_type과 file_name 추출
+        file_path = file_data.get("file_path", "")
+        path_parts = file_path.split("/")
+        file_data["benchmark_type"] = path_parts[-2] if len(path_parts) > 1 else ""
+        file_data["file_name"] = path_parts[-1] if path_parts else file_path
+        
         all_files.append(file_data)
     
     # Get modified files
@@ -142,6 +149,13 @@ async def get_all_project_files(project_id: str):
     async for doc in modified_cursor:
         file_data = dict(doc)
         file_data["source"] = "modified"  # Mark as modified file
+        
+        # file_path에서 benchmark_type과 file_name 추출
+        file_path = file_data.get("file_path", "")
+        path_parts = file_path.split("/")
+        file_data["benchmark_type"] = path_parts[-2] if len(path_parts) > 1 else ""
+        file_data["file_name"] = path_parts[-1] if path_parts else file_path
+        
         all_files.append(file_data)
     
     return all_files 

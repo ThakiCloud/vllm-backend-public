@@ -30,7 +30,6 @@ async def create_project(project_data: ProjectCreate) -> Project:
         "config_path": project_data.config_path or "config",
         "job_path": project_data.job_path or "job",
         "vllm_values_path": project_data.vllm_values_path or "",
-        "polling_interval": project_data.polling_interval,
         "created_at": now,
         "updated_at": now,
         "last_sync": None
@@ -39,12 +38,7 @@ async def create_project(project_data: ProjectCreate) -> Project:
     await collection.insert_one(project_doc)
     
     project = Project(**project_doc)
-    
-    try:
-        await project_poller.start_polling(project_id, project_data.polling_interval)
-        logging.info(f"Started polling for new project {project_id}")
-    except Exception as e:
-        logging.error(f"Failed to start polling for project {project_id}: {e}")
+    logging.info(f"Created project {project_id} - manual sync only")
     
     return project
 
@@ -98,25 +92,11 @@ async def update_project(project_id: str, update_data: ProjectUpdate) -> Optiona
     )
     
     if result.modified_count > 0:
-        if "polling_interval" in update_dict:
-            try:
-                await project_poller.stop_polling(project_id)
-                await project_poller.start_polling(project_id, update_dict["polling_interval"])
-                logging.info(f"Restarted polling for project {project_id} with new interval")
-            except Exception as e:
-                logging.error(f"Failed to restart polling for project {project_id}: {e}")
-        
         return await get_project(project_id)
     return None
 
 async def delete_project(project_id: str) -> bool:
     """Delete a project and all its files."""
-    try:
-        await project_poller.stop_polling(project_id)
-        logging.info(f"Stopped polling for deleted project {project_id}")
-    except Exception as e:
-        logging.error(f"Failed to stop polling for project {project_id}: {e}")
-    
     projects_collection = get_projects_collection()
     files_collection = get_original_files_collection()
     
@@ -170,6 +150,8 @@ async def get_project_stats(project_id: str) -> ProjectStats:
 # File Synchronization
 # -----------------------------------------------------------------------------
 
+
+
 async def sync_project_files(project_id: str) -> SyncResponse:
     """Sync files from GitHub for a specific project."""
     project = await get_project(project_id)
@@ -189,8 +171,8 @@ async def sync_project_files(project_id: str) -> SyncResponse:
             # VLLM 프로젝트의 경우 custom-values*.yaml 파일들을 찾음
             all_files = await github_client.fetch_vllm_files(project.vllm_values_path)
         else:
-            # Benchmark 프로젝트의 경우 기존 로직 사용
-            all_files = await github_client.fetch_all_files(project.config_path, project.job_path)
+            # Benchmark 프로젝트의 경우 벤치마크 폴더에서 종류별 파일들 가져오기
+            all_files = await github_client.fetch_all_files(project.config_path)
         
         files_collection = get_original_files_collection()
         
@@ -291,6 +273,13 @@ async def get_project_files(project_id: str, file_type: Optional[str] = None):
     async for doc in original_cursor:
         file_data = dict(doc)
         file_data["source"] = "original"  # Mark as original file
+        
+        # file_path에서 benchmark_type과 file_name 추출
+        file_path = file_data.get("file_path", "")
+        path_parts = file_path.split("/")
+        file_data["benchmark_type"] = path_parts[-2] if len(path_parts) > 1 else ""
+        file_data["file_name"] = path_parts[-1] if path_parts else file_path
+        
         all_files.append(file_data)
     
     # Query for modified files
@@ -303,64 +292,17 @@ async def get_project_files(project_id: str, file_type: Optional[str] = None):
     async for doc in modified_cursor:
         file_data = dict(doc)
         file_data["source"] = "modified"  # Mark as modified file
+        
+        # file_path에서 benchmark_type과 file_name 추출
+        file_path = file_data.get("file_path", "")
+        path_parts = file_path.split("/")
+        file_data["benchmark_type"] = path_parts[-2] if len(path_parts) > 1 else ""
+        file_data["file_name"] = path_parts[-1] if path_parts else file_path
+        
         all_files.append(file_data)
     
     return all_files
 
 # -----------------------------------------------------------------------------
-# Background Polling
-# -----------------------------------------------------------------------------
-
-class ProjectPoller:
-    def __init__(self):
-        self.running = False
-        self.tasks = {}
-    
-    async def start_polling(self, project_id: str, interval: int):
-        """Start polling for a specific project."""
-        if project_id in self.tasks:
-            await self.stop_polling(project_id)
-        
-        task = asyncio.create_task(self._poll_project(project_id, interval))
-        self.tasks[project_id] = task
-        logging.info(f"Started polling for project {project_id} with interval {interval}s")
-    
-    async def stop_polling(self, project_id: str):
-        """Stop polling for a specific project."""
-        if project_id in self.tasks:
-            self.tasks[project_id].cancel()
-            try:
-                await self.tasks[project_id]
-            except asyncio.CancelledError:
-                pass
-            del self.tasks[project_id]
-            logging.info(f"Stopped polling for project {project_id}")
-    
-    async def _poll_project(self, project_id: str, interval: int):
-        """Background polling task for a project."""
-        while True:
-            try:
-                await sync_project_files(project_id)
-                await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.error(f"Error in polling for project {project_id}: {e}")
-                await asyncio.sleep(interval)
-    
-    async def start_all_polling(self):
-        """Start polling for all projects."""
-        projects = await list_projects()
-        for project in projects:
-            await self.start_polling(project.project_id, project.polling_interval)
-        logging.info(f"Started polling for {len(projects)} projects")
-    
-    async def stop_all_polling(self):
-        """Stop all polling tasks."""
-        project_ids = list(self.tasks.keys())
-        for project_id in project_ids:
-            await self.stop_polling(project_id)
-        logging.info(f"Stopped polling for {len(project_ids)} projects")
-
-# Global poller instance
-project_poller = ProjectPoller() 
+# Background Polling (DISABLED - Manual sync only)
+# ----------------------------------------------------------------------------- 

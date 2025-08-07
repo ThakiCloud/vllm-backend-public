@@ -15,7 +15,6 @@ class ProjectCreate(BaseModel):
     config_path: Optional[str] = Field("config", description="Config folder path in repository")
     job_path: Optional[str] = Field("job", description="Job folder path in repository")
     vllm_values_path: Optional[str] = Field("", description="VLLM values files path in repository")
-    polling_interval: Optional[int] = Field(86400, description="Polling interval in seconds")
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
@@ -25,7 +24,6 @@ class ProjectUpdate(BaseModel):
     config_path: Optional[str] = None
     job_path: Optional[str] = None
     vllm_values_path: Optional[str] = None
-    polling_interval: Optional[int] = None
 
 class Project(BaseModel):
     project_id: str
@@ -36,7 +34,6 @@ class Project(BaseModel):
     config_path: str
     job_path: str
     vllm_values_path: Optional[str] = ""
-    polling_interval: int
     created_at: datetime
     updated_at: datetime
     last_sync: Optional[datetime] = None
@@ -54,6 +51,8 @@ class OriginalFile(BaseModel):
     sha: str
     last_modified: datetime
     synced_at: datetime
+    benchmark_type: Optional[str] = ""
+    file_name: Optional[str] = ""
 
 class ModifiedFile(BaseModel):
     file_id: Optional[str] = Field(default_factory=lambda: str(uuid4()))
@@ -64,6 +63,8 @@ class ModifiedFile(BaseModel):
     content: str
     created_at: Optional[datetime] = None
     modified_at: Optional[datetime] = None
+    benchmark_type: Optional[str] = ""
+    file_name: Optional[str] = ""
 
 # -----------------------------------------------------------------------------
 # API Request/Response Models

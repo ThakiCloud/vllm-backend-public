@@ -14,7 +14,7 @@ from models import (
 )
 from project_manager import (
     create_project, get_project, list_projects, update_project, delete_project,
-    get_project_with_stats, sync_project_files, get_project_files, project_poller
+    get_project_with_stats, sync_project_files, get_project_files
 )
 from file_manager import (
     create_modified_file, get_modified_file,
@@ -51,13 +51,13 @@ app.add_middleware(
 async def startup_event():
     """Initialize application."""
     await connect_to_mongo()
-    await project_poller.start_all_polling()
+    logging.info("🚀 Benchmark manager started - manual sync only")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup application."""
-    await project_poller.stop_all_polling()
     await close_mongo_connection()
+    logging.info("🛑 Benchmark manager stopped")
 
 # -----------------------------------------------------------------------------
 # Health Check
@@ -141,6 +141,22 @@ async def sync_project(project_id: str):
     """Manually trigger project file synchronization."""
     return await sync_project_files(project_id)
 
+@app.post("/projects/sync-all", response_model=List[SyncResponse])
+async def sync_all_projects_endpoint():
+    """Sync all projects in parallel."""
+    import asyncio
+    
+    projects = await list_projects()
+    
+    if not projects:
+        return []
+    
+    # 모든 프로젝트를 병렬로 sync
+    sync_tasks = [sync_project_files(project.project_id) for project in projects]
+    results = await asyncio.gather(*sync_tasks)
+    
+    return results
+
 @app.get("/projects/{project_id}/files")
 async def get_project_files_endpoint(project_id: str, file_type: Optional[str] = None):
     """Get all files for a project."""
@@ -207,4 +223,11 @@ async def reset_project_files(project_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+
+    uvicorn.run(
+        "main:app",  # 문자열로 전달
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        reload=True,
+        log_level="info",
+    )
