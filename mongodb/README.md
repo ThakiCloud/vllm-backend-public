@@ -69,10 +69,10 @@ kubectl apply -f mongo.yaml
 
 ```bash
 # 초기 데이터베이스 및 사용자 생성
-kubectl exec -it mongodb-0 -- bash /scripts/create-databases.sh
+kubectl exec -it mongo-0 -- bash /scripts/create-databases.sh
 
 # 데이터베이스 리셋 (개발용)
-kubectl exec -it mongodb-0 -- bash /scripts/reset-databases.sh
+kubectl exec -it mongo-0 -- bash /scripts/reset-databases.sh
 ```
 
 ## 📂 파일 구조
@@ -90,13 +90,13 @@ mongodb/
 ## 🔧 구성 요소
 
 ### StatefulSet (mongo-cluster.yaml)
-- **mongodb-0**: Primary 노드
-- **mongodb-1**: Secondary 노드  
-- **mongodb-2**: Secondary 노드
+- **mongo-0**: Primary 노드
+- **mongo-1**: Secondary 노드  
+- **mongo-2**: Secondary 노드
 - **영구 저장소**: 각 노드당 10Gi PVC
 
 ### 서비스 (mongo.yaml)
-- **mongodb-service**: 내부 클러스터 접근 (포트 27017)
+- **mongo-service**: 내부 클러스터 접근 (포트 27017)
 - **LoadBalancer**: 외부 접근 가능 (선택사항)
 
 ### 보안 (mongo-secrets.yaml)
@@ -108,26 +108,26 @@ mongodb/
 ### 내부 서비스 연결 (Kubernetes 내부)
 
 ```bash
-mongodb://admin:password123@mongodb-service:27017/?replicaSet=rs0&authSource=admin
+mongodb://admin:your-password@mongo-service:27017/?replicaSet=rs0&authSource=admin
 ```
 
 ### 외부 연결 (LoadBalancer 사용시)
 
 ```bash
-mongodb://admin:password123@<EXTERNAL-IP>:27017/?replicaSet=rs0&authSource=admin
+mongodb://admin:your-password@<EXTERNAL-IP>:27017/?replicaSet=rs0&authSource=admin
 ```
 
 ### 애플리케이션별 연결 문자열
 
 ```bash
 # benchmark-manager
-mongodb://manager-user:manager-pass@mongodb-service:27017/benchmark_manager?replicaSet=rs0&authSource=benchmark_manager
+mongodb://manager-user:manager-pass@mongo-service:27017/benchmark_manager?replicaSet=rs0&authSource=benchmark_manager
 
 # benchmark-deployer  
-mongodb://deployer-user:deployer-pass@mongodb-service:27017/benchmark_deployer?replicaSet=rs0&authSource=benchmark_deployer
+mongodb://deployer-user:deployer-pass@mongo-service:27017/benchmark_deployer?replicaSet=rs0&authSource=benchmark_deployer
 
 # benchmark-results
-mongodb://results-user:results-pass@mongodb-service:27017/benchmark_results?replicaSet=rs0&authSource=benchmark_results
+mongodb://results-user:results-pass@mongo-service:27017/benchmark_results?replicaSet=rs0&authSource=benchmark_results
 ```
 
 ## 💾 데이터베이스 구조
@@ -152,29 +152,29 @@ mongodb://results-user:results-pass@mongodb-service:27017/benchmark_results?repl
 ```bash
 kubectl get pods -l app=mongodb
 kubectl get pvc -l app=mongodb
-kubectl logs mongodb-0
+kubectl logs mongo-0
 ```
 
 ### 레플리카 셋 상태 확인
 
 ```bash
-kubectl exec -it mongodb-0 -- mongosh --eval "rs.status()"
+kubectl exec -it mongo-0 -- mongosh --eval "rs.status()"
 ```
 
 ### 데이터베이스 목록 확인
 
 ```bash
-kubectl exec -it mongodb-0 -- mongosh -u admin -p password123 --eval "show dbs"
+kubectl exec -it mongo-0 -- mongosh -u admin -p your-password --eval "show dbs"
 ```
 
 ### 백업 및 복원
 
 ```bash
 # 백업
-kubectl exec -it mongodb-0 -- mongodump --uri="mongodb://admin:password123@localhost:27017/?authSource=admin" --out /backup
+kubectl exec -it mongo-0 -- mongodump --uri="mongodb://admin:your-password@localhost:27017/?authSource=admin" --out /backup
 
 # 복원
-kubectl exec -it mongodb-0 -- mongorestore --uri="mongodb://admin:password123@localhost:27017/?authSource=admin" /backup
+kubectl exec -it mongo-0 -- mongorestore --uri="mongodb://admin:your-password@localhost:27017/?authSource=admin" /backup
 ```
 
 ## 🔧 트러블슈팅
@@ -187,7 +187,7 @@ kubectl exec -it mongodb-0 -- mongorestore --uri="mongodb://admin:password123@lo
 
 2. **레플리카 셋 초기화 실패**
    - 네트워크 정책 확인
-   - DNS 해상도 확인: `nslookup mongodb-service`
+   - DNS 해상도 확인: `nslookup mongo-service`
 
 3. **연결 실패**
    - 인증 정보 확인
@@ -197,10 +197,10 @@ kubectl exec -it mongodb-0 -- mongorestore --uri="mongodb://admin:password123@lo
 
 ```bash
 # MongoDB 로그
-kubectl logs mongodb-0
+kubectl logs mongo-0
 
 # 초기화 스크립트 로그
-kubectl logs mongodb-0 -c mongo-init
+kubectl logs mongo-0 -c mongo-init
 ```
 
 ## 📞 지원

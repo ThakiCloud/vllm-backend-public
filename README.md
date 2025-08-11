@@ -95,7 +95,7 @@ kubectl apply -f mongo-cluster.yaml
 kubectl apply -f mongo.yaml
 
 # 데이터베이스 초기화
-kubectl exec -it mongodb-0 -- bash /scripts/create-databases.sh
+kubectl exec -it mongo-0 -- bash /scripts/create-databases.sh
 ```
 
 ### 4. 마이크로서비스 배포
@@ -135,10 +135,10 @@ kubectl port-forward svc/benchmark-results-service 8000:8000 &
 
 ```bash
 # MongoDB 포트 포워딩
-kubectl port-forward svc/mongodb-service 27017:27017 &
+kubectl port-forward svc/mongo-service 27017:27017 &
 
 # 환경 변수 설정
-export MONGO_URL="mongodb://admin:password123@localhost:27017/?replicaSet=rs0&authSource=admin"
+export MONGO_URL="mongodb://admin:your-password@localhost:27017/?replicaSet=rs0&authSource=admin"
 export GITHUB_TOKEN="your_github_token"
 
 # 각 서비스 실행
@@ -180,7 +180,7 @@ docker-compose up -d
 
 ```bash
 # MongoDB 연결
-MONGO_URL="mongodb://admin:password123@mongodb-service:27017/?replicaSet=rs0&authSource=admin"
+MONGO_URL="mongodb://admin:your-password@mongo-service:27017/?replicaSet=rs0&authSource=admin"
 
 # GitHub (Manager만 필요)
 GITHUB_TOKEN="your_github_personal_access_token"
@@ -257,14 +257,14 @@ kubectl logs -l app=mongodb
    ```bash
    # MongoDB 상태 확인
    kubectl get pods -l app=mongodb
-   kubectl logs mongodb-0
+   kubectl logs mongo-0
    ```
 
 2. **서비스 간 통신 실패**
    ```bash
    # 네트워크 정책 확인
    kubectl get networkpolicies
-   kubectl describe svc mongodb-service
+   kubectl describe svc mongo-service
    ```
 
 3. **Kubernetes 배포 실패**
