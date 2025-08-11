@@ -98,7 +98,37 @@ kubectl apply -f mongo.yaml
 kubectl exec -it mongo-0 -- bash /scripts/create-databases.sh
 ```
 
-### 4. 마이크로서비스 배포
+### 4. 공유 보안 설정 (필수)
+
+마이크로서비스를 배포하기 전에 공유 보안 정보를 설정해야 합니다:
+
+```bash
+# benchmark-shared-secrets.yaml 파일 편집
+vi benchmark-shared-secrets.yaml
+```
+
+다음 항목들을 설정하세요:
+
+```yaml
+stringData:
+  # MongoDB 연결 URL (3단계에서 배포한 MongoDB 클러스터)
+  MONGO_URL: "mongodb://admin:your-password@mongo-service:27017/?replicaSet=rs0&authSource=admin"
+  
+  # GitHub Personal Access Token (repo 권한 필요)
+  GITHUB_TOKEN: "your_github_personal_access_token_here"
+```
+
+**설정 주의사항:**
+- `MONGO_URL`: MongoDB Secret에서 설정한 root 비밀번호와 일치해야 함
+- `GITHUB_TOKEN`: GitHub Personal Access Token (repo 권한 포함)
+- Token 생성: GitHub Settings → Developer settings → Personal access tokens
+
+```bash
+# 공유 보안 정보 배포
+kubectl apply -f benchmark-shared-secrets.yaml
+```
+
+### 5. 마이크로서비스 배포
 
 ```bash
 # Benchmark Manager 배포
@@ -114,7 +144,7 @@ cd ../benchmark-results
 kubectl apply -f benchmark-results-deployment.yaml
 ```
 
-### 5. 서비스 확인
+### 6. 서비스 확인
 
 ```bash
 # 모든 서비스 상태 확인
@@ -188,6 +218,8 @@ GITHUB_TOKEN="your_github_personal_access_token"
 # Kubernetes (Deployer만 필요)
 KUBECONFIG="/path/to/kubeconfig"
 ```
+
+> **참고**: 실제 운영 환경에서는 이러한 환경 변수들이 `benchmark-shared-secrets.yaml`을 통해 Kubernetes Secret으로 관리됩니다.
 
 ### 서비스별 포트
 
