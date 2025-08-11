@@ -27,6 +27,33 @@ VLLM 벤치마크 시스템의 모든 데이터를 저장하는 MongoDB 클러�
 
 ### Kubernetes 배포
 
+#### 1단계: 보안 설정 (필수)
+
+배포하기 전에 `mongo-secrets.yaml` 파일의 보안 정보를 먼저 설정해야 합니다:
+
+```bash
+# mongo-secrets.yaml 파일 편집
+vi mongo-secrets.yaml
+```
+
+다음 항목들을 설정하세요:
+
+```yaml
+stringData:
+  # MongoDB root 사용자 비밀번호 (최소 8자 이상 권장)
+  mongodb-root-password: "your-secure-password-here"
+
+stringData:
+  # MongoDB 레플리카 셋 인증용 키 (최소 6자 이상의 랜덤 문자열)
+  mongodb.key: "your-random-keyfile-string-here"
+```
+
+**보안 주의사항:**
+- `mongodb-root-password`: 강력한 비밀번호 사용 (대소문자, 숫자, 특수문자 조합)
+- `mongodb.key`: 최소 6자 이상의 랜덤 문자열 (레플리카 셋 내부 인증용)
+
+#### 2단계: 클러스터 배포
+
 ```bash
 # Secret 생성 (비밀번호 설정)
 kubectl apply -f mongo-secrets.yaml
