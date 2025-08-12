@@ -13,20 +13,33 @@ VLLM 모델의 벤치마크 실행을 위한 마이크로서비스 기반 백엔
 │   Frontend      │    │  Benchmark      │    │   GitHub        │
 │   (Web UI)      │◄──►│  Manager        │◄──►│   Repository    │
 └─────────────────┘    │  (Port: 8001)   │    └─────────────────┘
-                       └─────────────────┘
-                                │
-                                ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Benchmark      │    │   MongoDB       │    │  Benchmark      │
-│  Deployer       │◄──►│   Cluster       │◄──►│  Results        │
-│  (Port: 8002)   │    │  (Port: 27017)  │    │  (Port: 8000)   │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-        │
-        ▼
-┌─────────────────┐
-│   Kubernetes    │
-│   Cluster       │
-└─────────────────┘
+                       └─────────────────┘              ▲
+                                │                       │
+                                ▼                       │
+┌─────────────────┐    ┌─────────────────┐    ┌─────────┴─────────┐
+│  Benchmark      │    │   MongoDB       │    │  MLflow GitHub    │
+│  Deployer       │◄──►│   Cluster       │◄──►│  Integration      │
+│  (Port: 8002)   │    │  (Port: 27017)  │    │  (Port: 8003)     │
+└─────────────────┘    └─────────────────┘    └───────────────────┘
+        │                        ▲                       ▲
+        ▼                        │                       │
+┌─────────────────┐              │              ┌────────┴────────┐
+│   Kubernetes    │              │              │    MLflow       │
+│   Cluster       │              │              │   Server        │
+│        │        │              │              └─────────────────┘
+│  ┌───────────┐  │              │
+│  │   vLLM    │  │              │
+│  │ Service   │  │              │
+│  │(Port:8005)│  │              │
+│  └───────────┘  │              │
+└─────────────────┘              │
+        ▲                        │
+        │                        │
+┌─────────────────┐    ┌─────────┴─────────┐
+│  Benchmark      │    │  Benchmark        │
+│  Evaluation     │◄──►│  Results          │
+│  (Port: 8004)   │    │  (Port: 8000)     │
+└─────────────────┘    └───────────────────┘
 ```
 
 ## 📦 마이크로서비스 구성
@@ -54,6 +67,33 @@ VLLM 모델의 벤치마크 실행을 위한 마이크로서비스 기반 백엔
   - 원시/표준화 결과 분리 저장
   - RESTful API 기반 결과 조회
   - 메타데이터 관리
+
+### ⚡ [Benchmark vLLM Service](./benchmark-vllm/)
+- **포트**: 8005
+- **역할**: Kubernetes 클러스터에서 vLLM 서버 배포 및 관리
+- **주요 기능**:
+  - YAML 기반 vLLM 서버 배포
+  - GPU 리소스 충돌 감지 및 자동 해결
+  - 다중 모델 동시 배포 지원
+  - 실시간 배포 상태 모니터링
+
+### 🔄 [Benchmark Evaluation Service](./benchmark-eval/)
+- **포트**: 8004
+- **역할**: vLLM 모델 평가 작업 예약 및 실행
+- **주요 기능**:
+  - 스케줄링 기반 평가 실행
+  - GitHub 템플릿 동적 로딩
+  - 백그라운드 작업 처리
+  - 배포 서비스와 통합
+
+### 🔗 [MLflow GitHub Integration Service](./benchmark-mlflow/)
+- **포트**: 8003
+- **역할**: MLflow와 GitHub 레포지토리 자동 동기화
+- **주요 기능**:
+  - MLflow 모델 버전 폴링
+  - GitHub YAML 파일 자동 생성/업데이트
+  - 모델 메타데이터 관리
+  - 실시간 동기화
 
 ### 💾 [MongoDB Cluster](./mongodb/)
 - **포트**: 27017
@@ -142,6 +182,18 @@ kubectl apply -f benchmark-deployer-deployment.yaml
 # Benchmark Results 배포
 cd ../benchmark-results
 kubectl apply -f benchmark-results-deployment.yaml
+
+# Benchmark vLLM Service 배포
+cd ../benchmark-vllm
+kubectl apply -f benchmark-vllm-deployment.yaml
+
+# Benchmark Evaluation Service 배포
+cd ../benchmark-eval
+kubectl apply -f benchmark-eval-deployment.yaml
+
+# MLflow GitHub Integration Service 배포
+cd ../benchmark-mlflow
+kubectl apply -f benchmark-mlflow-deployment.yaml
 ```
 
 ### 6. 서비스 확인
@@ -155,6 +207,9 @@ kubectl get services
 kubectl port-forward svc/benchmark-manager-service 8001:8001 &
 kubectl port-forward svc/benchmark-deployer-service 8002:8002 &
 kubectl port-forward svc/benchmark-results-service 8000:8000 &
+kubectl port-forward svc/benchmark-vllm-service 8005:8005 &
+kubectl port-forward svc/benchmark-eval-service 8004:8004 &
+kubectl port-forward svc/benchmark-mlflow-service 8003:8003 &
 ```
 
 ## 🛠️ 개발 환경 설정
@@ -175,6 +230,9 @@ export GITHUB_TOKEN="your_github_token"
 cd benchmark-manager && python main.py &
 cd benchmark-deployer && python main.py &
 cd benchmark-results && python main.py &
+cd benchmark-vllm && python main.py &
+cd benchmark-eval && python main.py &
+cd benchmark-mlflow && python main.py &
 ```
 
 ### Docker Compose 개발 환경
@@ -204,6 +262,22 @@ docker-compose up -d
 - `POST /standardized_output` - 표준화 결과 저장
 - `GET /raw_input` - 결과 목록 조회
 
+### Benchmark vLLM Service (8005)
+- `GET /health` - 헬스 체크
+- `POST /deploy` - vLLM 서버 배포
+- `GET /deployments` - 배포 목록 조회
+- `DELETE /deployments/{id}` - 배포 삭제
+
+### Benchmark Evaluation Service (8004)
+- `GET /health` - 헬스 체크
+- `POST /evaluate` - 평가 작업 예약
+- `GET /` - 서비스 상태 확인
+
+### MLflow GitHub Integration Service (8003)
+- `GET /health` - 헬스 체크
+- `POST /poll` - 수동 폴링 실행
+- `GET /connections` - 연결 상태 확인
+
 ## 🔧 설정 및 환경 변수
 
 ### 공통 환경 변수
@@ -226,6 +300,9 @@ KUBECONFIG="/path/to/kubeconfig"
 - **Benchmark Manager**: 8001
 - **Benchmark Deployer**: 8002  
 - **Benchmark Results**: 8000
+- **Benchmark vLLM Service**: 8005
+- **Benchmark Evaluation Service**: 8004
+- **MLflow GitHub Integration Service**: 8003
 - **MongoDB**: 27017
 
 ## 🔄 워크플로우
@@ -254,6 +331,9 @@ GitHub Repository → Manager → 설정 파일 동기화 → 수정 및 관리
 curl http://localhost:8001/health  # Manager
 curl http://localhost:8002/health  # Deployer
 curl http://localhost:8000/health  # Results
+curl http://localhost:8005/health  # vLLM Service
+curl http://localhost:8004/health  # Evaluation Service
+curl http://localhost:8003/health  # MLflow Integration
 ```
 
 ### 로그 확인
@@ -263,6 +343,9 @@ curl http://localhost:8000/health  # Results
 kubectl logs -l app=benchmark-manager
 kubectl logs -l app=benchmark-deployer
 kubectl logs -l app=benchmark-results
+kubectl logs -l app=benchmark-vllm
+kubectl logs -l app=benchmark-eval
+kubectl logs -l app=benchmark-mlflow
 kubectl logs -l app=mongodb
 ```
 
@@ -280,6 +363,9 @@ kubectl logs -l app=mongodb
 - **Manager**: http://localhost:8001/docs
 - **Deployer**: http://localhost:8002/docs  
 - **Results**: http://localhost:8000/docs
+- **vLLM Service**: http://localhost:8005/docs
+- **Evaluation Service**: http://localhost:8004/docs
+- **MLflow Integration**: http://localhost:8003/docs
 
 ## 🛠️ 트러블슈팅
 
