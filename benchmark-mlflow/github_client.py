@@ -25,7 +25,7 @@ class GitHubClient:
         self.config = config
         self.base_url = "https://api.github.com"
         self.headers = {
-            'Authorization': f'token {config.token}',
+            'Authorization': f'Bearer {config.token}',
             'Accept': 'application/vnd.github.v3+json',
             'User-Agent': 'MLflow-GitHub-Integration/1.0'
         }
