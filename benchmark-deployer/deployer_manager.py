@@ -53,6 +53,7 @@ class DeployerManager:
         logger.info("Initializing DeployerManager...")
         
         # Initialize MongoDB connection
+        await connect_to_mongo()
         self.db = get_database()
         logger.info("MongoDB connection established")
         
