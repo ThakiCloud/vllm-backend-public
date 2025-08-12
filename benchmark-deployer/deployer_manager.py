@@ -47,6 +47,7 @@ class DeployerManager:
         self.db = None
         self.k8s_client = KubernetesClient()
         self.terminal_manager = TerminalManager()
+        self.processing_queue = False
         
     async def initialize(self):
         """Initialize the deployer manager."""
