@@ -17,6 +17,8 @@ client = motor.motor_asyncio.AsyncIOMotorClient(
     MONGO_URL,
     # Prefer secondary for reads, fallback to primary if no secondary available
     read_preference=ReadPreference.SECONDARY_PREFERRED
+    serverSelectionTimeoutMS=60000,
+    connectTimeoutMS=60000,
 )
 
 db = client[DB_NAME]
