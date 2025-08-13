@@ -13,7 +13,7 @@ from models import (
     HealthResponse, SystemStatus,
     TerminalSessionRequest, TerminalSessionResponse, TerminalSessionInfo, TerminalSessionListResponse,
     VLLMDeploymentQueueRequest, VLLMDeploymentQueueResponse, VLLMQueueStatusResponse, QueuePriorityRequest,
-    VLLMHelmDeploymentRequest
+    VLLMHelmDeploymentRequest, BenchmarkRunRequest, BenchmarkRunResponse
 )
 from deployer_manager import deployer_manager
 from terminal_manager import terminal_manager
@@ -177,6 +177,18 @@ async def get_job_logs(request: LogRequest):
         return await deployer_manager.get_job_logs(request)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# Benchmark Run API
+# -----------------------------------------------------------------------------
+
+@app.post("/run", response_model=BenchmarkRunResponse)
+async def run_benchmark(request: BenchmarkRunRequest):
+    """Config와 vLLM 모델의 엔드포인트와 함께 벤치마크를 실행합니다."""
+    try:
+        return await deployer_manager.run_benchmark(request)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Terminal APIs 🔥
