@@ -73,6 +73,7 @@ kubectl apply -f benchmark-deployer-deployment.yaml
 - `POST /deploy` - YAML 배포
 - `POST /delete` - YAML 삭제  
 - `GET /deployments` - 활성 배포 목록
+- `POST /run` - 벤치마크 실행
 
 ### 작업 관리
 - `GET /jobs/{job_name}/status` - Job 상태 조회
