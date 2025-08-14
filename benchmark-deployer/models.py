@@ -284,4 +284,28 @@ class VLLMDeploymentResponse(BaseModel):
 # Priority change request
 class QueuePriorityRequest(BaseModel):
     """Request model for changing queue priority"""
-    priority: str = Field(..., description="New priority level") 
+    priority: str = Field(..., description="New priority level")
+
+# -----------------------------------------------------------------------------
+# Benchmark Run Models
+# -----------------------------------------------------------------------------
+
+class BenchmarkRunRequest(BaseModel):
+    """벤치마크 실행 요청을 위한 스키마"""
+    project_id: str = Field(..., description="프로젝트 ID")
+    benchmark_type: str = Field(..., description="벤치마크 타입")
+    name: str = Field(..., description="벤치마크 이름")
+    job_file_id: str = Field(..., description="벤치마크 Job 파일 ID")
+    config_file_id: Optional[str] = Field(None, description="벤치마크 Config 파일 ID")
+    vllm_model_endpoint: Optional[str] = Field(None, description="vLLM 모델의 엔드포인트")
+
+class BenchmarkRunResponse(BaseModel):
+    """벤치마크 실행 성공 응답을 위한 스키마"""
+    deployment_id: str = Field(..., description="벤치마크 배포 ID")
+    status: DeploymentStatus = Field(..., description="벤치마크 실행 상태")
+    resource_type: ResourceType = Field(..., description="벤치마크 실행 리소스 타입")
+    resource_name: str = Field(..., description="벤치마크 실행 리소스 이름")
+    namespace: str = Field(..., description="벤치마크 실행 네임스페이스")
+    yaml_content: str = Field(..., description="벤치마크 리소스 매니페스트 YAML")
+    message: str = Field(..., description="메시지")
+    created_at: datetime = Field(..., description="등록 시간") 

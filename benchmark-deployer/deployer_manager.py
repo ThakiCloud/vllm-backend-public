@@ -32,7 +32,7 @@ from models import (
     DeploymentRequest, DeploymentResponse, LogRequest, LogResponse,
     DeleteRequest, DeleteResponse, JobStatusResponse, ResourceType,
     TerminalSessionRequest, TerminalSessionResponse, TerminalSessionInfo, TerminalSessionListResponse,
-    VLLMHelmDeploymentRequest, VLLMHelmConfig
+    VLLMHelmDeploymentRequest, VLLMHelmConfig, BenchmarkRunRequest, BenchmarkRunResponse
 )
 from kubernetes_client import KubernetesClient
 from terminal_manager import TerminalManager
@@ -47,12 +47,14 @@ class DeployerManager:
         self.db = None
         self.k8s_client = KubernetesClient()
         self.terminal_manager = TerminalManager()
+        self.processing_queue = False
         
     async def initialize(self):
         """Initialize the deployer manager."""
         logger.info("Initializing DeployerManager...")
         
         # Initialize MongoDB connection
+        await connect_to_mongo()
         self.db = get_database()
         logger.info("MongoDB connection established")
         
@@ -2065,6 +2067,200 @@ class DeployerManager:
             
         except Exception as e:
             logger.error(f"Error during cleanup of VLLM request {queue_request_id}: {e}")
+
+    async def run_benchmark(self, request) -> 'BenchmarkRunResponse':
+        """벤치마크를 실행합니다."""
+        import aiohttp
+        import json
+        from config import BENCHMARK_MANAGER_URL
+        from models import BenchmarkRunResponse, DeploymentStatus, ResourceType
+        
+        try:
+            logger.info(f"Starting benchmark run: {request.name}")
+            
+            # Check if Kubernetes client is connected
+            if not self.k8s_client.is_connected:
+                logger.error("Kubernetes client is not connected. Attempting to reconnect...")
+                await self.k8s_client.initialize()
+            
+            # 1. Fetch project files list and find job/config files by ID
+            async with aiohttp.ClientSession() as session:
+                # Get project files list
+                files_list_url = f"{BENCHMARK_MANAGER_URL}/projects/{request.project_id}/files"
+                logger.info(f"Fetching project files list from: {files_list_url}")
+                
+                async with session.get(files_list_url) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to fetch project files list: HTTP {response.status} - {error_text}")
+                    files_list = await response.json()
+                
+                # Find job file by file_id
+                job_file = None
+                for file_info in files_list:
+                    if file_info.get("file_id") == request.job_file_id:
+                        job_file = file_info
+                        break
+                
+                if not job_file:
+                    raise Exception(f"Job file with ID {request.job_file_id} not found in project {request.project_id}")
+                
+                job_yaml_content = job_file.get("content")
+                if not job_yaml_content:
+                    raise Exception(f"Job file content is empty for file ID {request.job_file_id}")
+                
+                logger.info(f"Found job file: {job_file.get('file_name', 'unknown')} (type: {job_file.get('file_type', 'unknown')})")
+                
+                # Find config file by file_id (if provided)
+                config_json_content = None
+                if request.config_file_id:
+                    config_file = None
+                    for file_info in files_list:
+                        if file_info.get("file_id") == request.config_file_id:
+                            config_file = file_info
+                            break
+                    
+                    if not config_file:
+                        raise Exception(f"Config file with ID {request.config_file_id} not found in project {request.project_id}")
+                    
+                    config_json_content = config_file.get("content")
+                    if not config_json_content:
+                        raise Exception(f"Config file content is empty for file ID {request.config_file_id}")
+                    
+                    logger.info(f"Found config file: {config_file.get('file_name', 'unknown')} (type: {config_file.get('file_type', 'unknown')})")
+                else:
+                    logger.info("No config_file_id provided, skipping config file fetch")
+            
+            # 2. Parse and modify job YAML to add ConfigMap mount and environment variable
+            job_yaml_docs = list(yaml.safe_load_all(job_yaml_content))
+            
+            # Generate unique names
+            deployment_id = str(uuid.uuid4())
+            configmap_name = f"benchmark-config-{request.name}-{deployment_id[:8]}" if config_json_content else None
+            job_name = f"benchmark-job-{request.name}"
+            namespace = "benchmark"  # Use benchmark namespace as per documentation
+            
+            # Create ConfigMap YAML only if config file was provided
+            configmap_yaml = None
+            if config_json_content:
+                configmap_yaml = {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": configmap_name,
+                        "namespace": namespace
+                    },
+                    "data": {
+                        "eval_config.json": config_json_content
+                    }
+                }
+            
+            # Modify Job YAML to add ConfigMap mount and environment variable
+            for doc in job_yaml_docs:
+                if doc.get("kind") == "Job":
+                    # Update job name and namespace
+                    doc["metadata"]["name"] = job_name
+                    doc["metadata"]["namespace"] = namespace
+                    
+                    # Add ConfigMap volume only if config file was provided
+                    if configmap_yaml:
+                        if "volumes" not in doc["spec"]["template"]["spec"]:
+                            doc["spec"]["template"]["spec"]["volumes"] = []
+                        
+                        doc["spec"]["template"]["spec"]["volumes"].append({
+                            "name": "config-volume",
+                            "configMap": {
+                                "name": configmap_name
+                            }
+                        })
+                    
+                    # Add volume mount and environment variable to containers
+                    containers = doc["spec"]["template"]["spec"].get("containers", [])
+                    for container in containers:
+                        # Add volume mount only if config file was provided
+                        if configmap_yaml:
+                            if "volumeMounts" not in container:
+                                container["volumeMounts"] = []
+                            
+                            container["volumeMounts"].append({
+                                "name": "config-volume",
+                                "mountPath": "/app/configs",
+                                "readOnly": True
+                            })
+                        
+                        # Add environment variable for vLLM model endpoint
+                        if "env" not in container:
+                            container["env"] = []
+                        
+                        if request.vllm_model_endpoint:
+                            container["env"].append({
+                                "name": "VLLM_MODEL_ENDPOINT",
+                                "value": request.vllm_model_endpoint
+                            })
+            
+            # 3. Deploy ConfigMap first (only if config file was provided)
+            if configmap_yaml:
+                configmap_yaml_str = yaml.dump(configmap_yaml)
+                logger.info(f"Deploying ConfigMap: {configmap_name}")
+                
+                await self.k8s_client.deploy_yaml(
+                    yaml_content=configmap_yaml_str,
+                    namespace=namespace
+                )
+            else:
+                logger.info("No config file provided, skipping ConfigMap deployment")
+            
+            # 4. Deploy Job
+            modified_job_yaml = yaml.dump_all(job_yaml_docs)
+            logger.info(f"Deploying Job: {job_name}")
+            
+            result = await self.k8s_client.deploy_yaml(
+                yaml_content=modified_job_yaml,
+                namespace=namespace
+            )
+
+            status = DeploymentStatus.PENDING
+            resource_type = ResourceType.JOB
+            created_at = datetime.now()
+            
+            # 5. Store deployment info in database
+            deployment_doc = {
+                "deployment_id": deployment_id,
+                "resource_name": job_name,
+                "resource_type": str(resource_type),
+                "namespace": namespace,
+                "yaml_content": modified_job_yaml,
+                "created_at": created_at,
+                "status": str(status),
+                "benchmark_type": request.benchmark_type,
+                "project_id": request.project_id,
+            }
+            
+            # Add configmap_name only if it exists
+            if configmap_name:
+                deployment_doc["configmap_name"] = configmap_name
+            
+            # Insert into database
+            deployments_collection = get_deployments_collection()
+            await deployments_collection.insert_one(deployment_doc)
+            
+            logger.info(f"Successfully deployed benchmark: {request.name}")
+            
+            # 6. Return response
+            return BenchmarkRunResponse(
+                deployment_id=deployment_id,
+                status=status,
+                resource_type=resource_type,
+                resource_name=job_name,
+                namespace=namespace,
+                yaml_content=modified_job_yaml,
+                message="벤치마크가 성공적으로 배포되었습니다.",
+                created_at=created_at
+            )
+            
+        except Exception as e:
+            logger.error(f"Error running benchmark {request.name}: {e}")
+            raise Exception(f"벤치마크 실행에 실패했습니다: {str(e)}")
 
 # Global instance
 deployer_manager = DeployerManager() 

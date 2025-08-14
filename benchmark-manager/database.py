@@ -21,8 +21,9 @@ async def connect_to_mongo():
     try:
         db.client = motor.motor_asyncio.AsyncIOMotorClient(
             MONGO_URL,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000
+            read_preference=ReadPreference.SECONDARY_PREFERRED,
+            serverSelectionTimeoutMS=60000,
+            connectTimeoutMS=60000
         )
         db.db = db.client[DB_NAME]
         
